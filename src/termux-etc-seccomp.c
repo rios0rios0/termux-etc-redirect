@@ -1,10 +1,18 @@
 /*
- * termux-etc-seccomp.c — seccomp user_notif interceptor for Termux
+ * termux-etc-seccomp.c — seccomp + ptrace interceptor for Termux
  *
- * Intercepts openat() syscalls at kernel level using seccomp
- * SECCOMP_RET_USER_NOTIF and redirects reads of
- *   /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf
- * to their Termux equivalents under $PREFIX/etc/.
+ * Uses two complementary mechanisms:
+ *
+ * 1. seccomp USER_NOTIF: Intercepts openat() syscalls and redirects
+ *    reads of /etc/resolv.conf, /etc/hosts, /etc/nsswitch.conf, and
+ *    SSL certificate paths to their Termux equivalents under $PREFIX/etc/.
+ *
+ * 2. ptrace SIGSYS suppression: Android's seccomp policy blocks certain
+ *    syscalls (like faccessat2) with SECCOMP_RET_TRAP, sending SIGSYS.
+ *    The kernel sets the return value to -ENOSYS before sending the
+ *    signal. By ptracing the child and suppressing SIGSYS, the child
+ *    sees -ENOSYS and falls back to an allowed syscall (e.g., faccessat).
+ *    This is essential for Go binaries that use os/exec.LookPath.
  *
  * Works on ALL binaries, including statically linked Go programs
  * that bypass libc entirely.
@@ -20,6 +28,7 @@
 #include <linux/filter.h>
 #include <linux/limits.h>
 #include <linux/seccomp.h>
+#include <poll.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -27,11 +36,16 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#ifndef __WALL
+#define __WALL 0x40000000
+#endif
 
 #define TERMUX_DEFAULT_PREFIX "/data/data/com.termux/files/usr"
 
@@ -213,7 +227,7 @@ static int install_seccomp_filter(void) {
 }
 
 /*
- * Handle a single seccomp notification.
+ * Handle a single seccomp notification (openat redirect).
  */
 static int handle_notification(int notif_fd) {
     struct seccomp_notif req;
@@ -274,17 +288,61 @@ pass_through:
     return 0;
 }
 
-static volatile sig_atomic_t g_child_exited = 0;
+/*
+ * Drain all pending ptrace events (non-blocking).
+ *
+ * When Android's seccomp sends SIGSYS for a blocked syscall
+ * (e.g., faccessat2), the kernel has already set the syscall return
+ * value to -ENOSYS. We suppress the SIGSYS so the child continues
+ * with -ENOSYS, allowing Go's runtime to fall back to faccessat.
+ *
+ * PTRACE_O_TRACECLONE/TRACEFORK/TRACEVFORK ensure all threads
+ * and child processes are auto-traced, so SIGSYS is caught
+ * everywhere (Go runtime threads + spawned subprocesses).
+ */
+static void drain_ptrace_events(pid_t main_child,
+                                int *main_exited, int *exit_status) {
+    int status;
+    pid_t pid;
+
+    while ((pid = waitpid(-1, &status, WNOHANG | __WALL)) > 0) {
+        if (WIFSTOPPED(status)) {
+            int sig = WSTOPSIG(status);
+            unsigned int event = (unsigned int)status >> 16;
+
+            if (event != 0) {
+                /* ptrace event (CLONE, EXEC, etc.) — continue */
+                ptrace(PTRACE_CONT, pid, 0, 0);
+            } else if (sig == SIGSYS || sig == SIGSTOP || sig == SIGTRAP) {
+                /* Suppress SIGSYS: kernel already set retval to -ENOSYS.
+                 * Suppress SIGSTOP/SIGTRAP: initial stops for newly
+                 * traced threads/processes from TRACECLONE/TRACEFORK. */
+                ptrace(PTRACE_CONT, pid, 0, 0);
+            } else {
+                /* Deliver other signals normally */
+                ptrace(PTRACE_CONT, pid, 0, sig);
+            }
+        } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (pid == main_child) {
+                *main_exited = 1;
+                *exit_status = status;
+            }
+        }
+    }
+}
+
+static volatile sig_atomic_t g_sigchld = 0;
 
 static void sigchld_handler(int sig) {
     (void)sig;
-    g_child_exited = 1;
+    g_sigchld = 1;
 }
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s <command> [args...]\n\n"
-            "Intercepts openat() syscalls and redirects /etc/resolv.conf,\n"
-            "/etc/hosts, /etc/nsswitch.conf to $PREFIX/etc/ equivalents.\n"
+            "Intercepts openat() to redirect /etc/ paths to $PREFIX/etc/,\n"
+            "and suppresses SIGSYS from Android's seccomp policy so that\n"
+            "blocked syscalls (like faccessat2) return -ENOSYS gracefully.\n"
             "Works on all binaries, including statically linked Go programs.\n",
             argv0);
 }
@@ -297,10 +355,12 @@ int main(int argc, char *argv[]) {
 
     build_prefix();
 
+    /* SIGCHLD interrupts poll(), letting us drain ptrace events.
+     * Do NOT set SA_NOCLDSTOP — we need SIGCHLD for ptrace stops. */
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = sigchld_handler;
-    sa.sa_flags = SA_NOCLDSTOP;
+    sa.sa_flags = 0;
     sigaction(SIGCHLD, &sa, NULL);
 
     /* Unix socketpair for passing the seccomp notif fd via SCM_RIGHTS. */
@@ -362,6 +422,22 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Ptrace-seize the child BEFORE ack (before exec).
+     * TRACECLONE auto-traces new threads (Go runtime M's).
+     * TRACEFORK/TRACEVFORK auto-traces child processes spawned
+     * via os/exec.Command (e.g., terra → terragrunt). */
+    int ptrace_ok = 0;
+    if (ptrace(PTRACE_SEIZE, child, 0,
+               (void *)(long)(PTRACE_O_TRACECLONE |
+                              PTRACE_O_TRACEFORK |
+                              PTRACE_O_TRACEVFORK)) == 0) {
+        ptrace_ok = 1;
+    } else {
+        fprintf(stderr,
+                "termux-etc-seccomp: ptrace seize failed (%s), "
+                "SIGSYS suppression disabled\n", strerror(errno));
+    }
+
     /* Acknowledge so child can proceed to exec. */
     char ack = 'A';
     if (write(sock_fds[0], &ack, 1) < 0) {
@@ -369,27 +445,66 @@ int main(int argc, char *argv[]) {
     }
     close(sock_fds[0]);
 
-    /* Notification loop.
-     * SIGCHLD will interrupt the blocking ioctl with EINTR,
-     * allowing us to check g_child_exited and exit cleanly. */
-    while (!g_child_exited) {
-        int ret = handle_notification(notif_fd);
+    /*
+     * Main event loop.
+     *
+     * poll() on the seccomp notif fd blocks until either:
+     *   - An openat() notification arrives (POLLIN)
+     *   - SIGCHLD fires (EINTR), signaling a ptrace stop or child exit
+     *
+     * After each SIGCHLD, drain_ptrace_events() processes all pending
+     * ptrace stops:
+     *   - SIGSYS: suppressed (child sees -ENOSYS, falls back gracefully)
+     *   - CLONE events: new thread, continue immediately
+     *   - Other signals: delivered to the child
+     *   - Child exit: loop terminates
+     */
+    int main_exited = 0;
+    int exit_status = 0;
+
+    while (!main_exited) {
+        if (ptrace_ok)
+            drain_ptrace_events(child, &main_exited, &exit_status);
+        if (main_exited) break;
+
+        struct pollfd pfd = { .fd = notif_fd, .events = POLLIN };
+        int ret = poll(&pfd, 1, -1);
+
         if (ret < 0) {
-            if (errno == EINTR) continue; /* Interrupted by signal */
+            if (errno == EINTR) continue;
             if (errno == EBADF || errno == EINVAL) break;
             continue;
+        }
+
+        if (ret > 0) {
+            /* If the seccomp notif fd becomes unusable, exit the loop
+             * so the supervisor can clean up instead of spinning. */
+            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                break;
+            }
+            if (pfd.revents & POLLIN) {
+                int hn_ret = handle_notification(notif_fd);
+                if (hn_ret < 0) {
+                    fprintf(stderr, "termux-etc-seccomp: handle_notification() failed, exiting event loop\n");
+                    break;
+                }
+            }
         }
     }
 
     close(notif_fd);
-    int status = 0;
-    waitpid(child, &status, 0);
 
-    if (WIFEXITED(status))
-        return WEXITSTATUS(status);
-    if (WIFSIGNALED(status)) {
-        signal(WTERMSIG(status), SIG_DFL);
-        raise(WTERMSIG(status));
+    /* If we didn't collect the exit status from ptrace events
+     * (e.g., ptrace was not available), collect it now. */
+    if (!main_exited) {
+        waitpid(child, &exit_status, 0);
+    }
+
+    if (WIFEXITED(exit_status))
+        return WEXITSTATUS(exit_status);
+    if (WIFSIGNALED(exit_status)) {
+        signal(WTERMSIG(exit_status), SIG_DFL);
+        raise(WTERMSIG(exit_status));
     }
     return 1;
 }
