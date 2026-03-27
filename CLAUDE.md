@@ -26,13 +26,18 @@ The project has two tiers that share the same redirect table but operate at diff
 An `LD_PRELOAD` shared library that intercepts libc functions (`open`, `openat`, `fopen`, `access`, `faccessat`, `stat`, `lstat`) via `dlsym(RTLD_NEXT, ...)`. Works only for dynamically linked binaries. Each intercepted function calls `redirect()` which checks the path against `REDIRECT_TABLE`, builds the Termux-prefixed path, verifies the target exists (via raw syscall to avoid recursion), and returns the rewritten path.
 
 ### Tier 2: `src/termux-etc-seccomp.c` → `termux-etc-seccomp`
-A seccomp `user_notif` supervisor that intercepts `openat` syscalls at the kernel level via BPF. Works on **all** binaries including statically linked Go programs. The supervisor forks a child, the child installs the BPF filter and sends the notification fd to the parent via `SCM_RIGHTS` over a Unix socketpair, then execs the target command. The parent loops on `SECCOMP_IOCTL_NOTIF_RECV`, reads paths from `/proc/<pid>/mem`, and injects replacement fds via `SECCOMP_IOCTL_NOTIF_ADDFD`.
+A hybrid seccomp + ptrace supervisor. Uses two complementary mechanisms:
+1. **seccomp `user_notif`**: Intercepts `openat` syscalls via BPF and redirects `/etc/` paths to `$PREFIX/etc/`.
+2. **ptrace SIGSYS suppression**: Android's seccomp policy blocks certain syscalls (like `faccessat2`) with `SECCOMP_RET_TRAP`, sending SIGSYS. Since the kernel sets the return value to `-ENOSYS` before sending the signal, suppressing SIGSYS via ptrace lets Go's runtime see `-ENOSYS` and fall back to allowed syscalls (e.g., `faccessat`).
+
+The supervisor forks a child, the child installs the BPF filter and sends the notification fd to the parent via `SCM_RIGHTS` over a Unix socketpair. The parent `PTRACE_SEIZE`s the child with `TRACECLONE|TRACEFORK|TRACEVFORK` to auto-trace all threads and child processes. A `poll()`-based event loop handles both seccomp notifications (openat redirect) and ptrace events (SIGSYS suppression).
 
 ### Key design decisions
 - **Fail-open**: if the Termux destination file doesn't exist, the original path passes through unchanged.
 - **BPF filter is aarch64-only** (`AUDIT_ARCH_AARCH64` hardcoded in the filter).
 - **Redirect table is duplicated** in both source files — changes to redirected paths must be updated in both `src/termux-etc-redirect.c` and `src/termux-etc-seccomp.c`.
 - **`$PREFIX` defaults to `/data/data/com.termux/files/usr`** when the environment variable is not set.
+- **ptrace traces all descendants**: `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK` ensures SIGSYS is caught on Go runtime threads and spawned child processes (e.g., `terra` spawning `terragrunt`).
 
 ## Testing
 
