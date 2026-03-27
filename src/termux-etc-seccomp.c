@@ -313,8 +313,10 @@ static void drain_ptrace_events(pid_t main_child,
             if (event != 0) {
                 /* ptrace event (CLONE, EXEC, etc.) — continue */
                 ptrace(PTRACE_CONT, pid, 0, 0);
-            } else if (sig == SIGSYS) {
-                /* Suppress SIGSYS: kernel already set retval to -ENOSYS */
+            } else if (sig == SIGSYS || sig == SIGSTOP || sig == SIGTRAP) {
+                /* Suppress SIGSYS: kernel already set retval to -ENOSYS.
+                 * Suppress SIGSTOP/SIGTRAP: initial stops for newly
+                 * traced threads/processes from TRACECLONE/TRACEFORK. */
                 ptrace(PTRACE_CONT, pid, 0, 0);
             } else {
                 /* Deliver other signals normally */
@@ -474,8 +476,19 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        if (ret > 0 && (pfd.revents & POLLIN)) {
-            handle_notification(notif_fd);
+        if (ret > 0) {
+            /* If the seccomp notif fd becomes unusable, exit the loop
+             * so the supervisor can clean up instead of spinning. */
+            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+                break;
+            }
+            if (pfd.revents & POLLIN) {
+                int hn_ret = handle_notification(notif_fd);
+                if (hn_ret < 0) {
+                    fprintf(stderr, "termux-etc-seccomp: handle_notification() failed, exiting event loop\n");
+                    break;
+                }
+            }
         }
     }
 
