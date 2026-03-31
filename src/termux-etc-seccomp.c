@@ -24,6 +24,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#if !defined(__aarch64__)
+#error "termux-etc-seccomp requires aarch64 (ARM64). Other architectures are not supported."
+#endif
+
 #include <asm/ptrace.h>
 #include <elf.h>
 #include <errno.h>
@@ -302,16 +306,24 @@ pass_through:
  * We must explicitly set x0 so the child's runtime (e.g., Go's
  * exec.LookPath) sees -ENOSYS and falls back to allowed syscalls.
  */
-static void set_return_enosys(pid_t pid) {
+static int set_return_enosys(pid_t pid) {
     struct user_pt_regs regs;
     struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
 
-    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0)
-        return;
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) {
+        fprintf(stderr, "termux-etc-seccomp: PTRACE_GETREGSET failed for "
+                "pid %d: %s\n", (int)pid, strerror(errno));
+        return -1;
+    }
 
     regs.regs[0] = (unsigned long long)(-ENOSYS);
     iov.iov_len = sizeof(regs);
-    ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov);
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) {
+        fprintf(stderr, "termux-etc-seccomp: PTRACE_SETREGSET failed for "
+                "pid %d: %s\n", (int)pid, strerror(errno));
+        return -1;
+    }
+    return 0;
 }
 
 /*
@@ -341,7 +353,10 @@ static void drain_ptrace_events(pid_t main_child,
                 ptrace(PTRACE_CONT, pid, 0, 0);
             } else if (sig == SIGSYS) {
                 /* Set x0 = -ENOSYS and suppress the signal */
-                set_return_enosys(pid);
+                if (set_return_enosys(pid) != 0)
+                    fprintf(stderr, "termux-etc-seccomp: warning: "
+                            "failed to set -ENOSYS for pid %d, "
+                            "child may see wrong errno\n", (int)pid);
                 ptrace(PTRACE_CONT, pid, 0, 0);
             } else if (sig == SIGSTOP || sig == SIGTRAP) {
                 /* Suppress SIGSTOP/SIGTRAP: initial stops for newly
