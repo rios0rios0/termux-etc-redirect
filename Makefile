@@ -30,14 +30,20 @@ install: all
 clean:
 	rm -rf $(BUILD_DIR)
 
-test: all $(BUILD_DIR)/test-redirect
+test: all $(BUILD_DIR)/test-redirect $(BUILD_DIR)/test-faccessat2
 	@echo "=== Tier 1: LD_PRELOAD unit test ==="
 	LD_PRELOAD=$(CURDIR)/$(BUILD_DIR)/$(LIBNAME) $(BUILD_DIR)/test-redirect
 	@echo ""
 	@echo "=== Tier 2: seccomp integration test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) cat /etc/resolv.conf
 	@echo ""
+	@echo "=== Tier 3: faccessat2 SIGSYS suppression test ==="
+	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) $(BUILD_DIR)/test-faccessat2
+	@echo ""
 	@echo "=== All tests passed ==="
 
 $(BUILD_DIR)/test-redirect: test/test-redirect.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/test-faccessat2: test/test-faccessat2.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $<

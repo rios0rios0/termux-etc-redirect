@@ -9,10 +9,12 @@
  *
  * 2. ptrace SIGSYS suppression: Android's seccomp policy blocks certain
  *    syscalls (like faccessat2) with SECCOMP_RET_TRAP, sending SIGSYS.
- *    The kernel sets the return value to -ENOSYS before sending the
- *    signal. By ptracing the child and suppressing SIGSYS, the child
- *    sees -ENOSYS and falls back to an allowed syscall (e.g., faccessat).
- *    This is essential for Go binaries that use os/exec.LookPath.
+ *    The kernel calls syscall_rollback() which restores x0 to the
+ *    original first argument (NOT -ENOSYS). By ptracing the child,
+ *    catching the SIGSYS stop, and explicitly setting x0 to -ENOSYS
+ *    before resuming, the child falls back to an allowed syscall
+ *    (e.g., faccessat). This is essential for Go binaries that use
+ *    os/exec.LookPath.
  *
  * Works on ALL binaries, including statically linked Go programs
  * that bypass libc entirely.
@@ -22,6 +24,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#if !defined(__aarch64__)
+#error "termux-etc-seccomp requires aarch64 (ARM64). Other architectures are not supported."
+#endif
+
+#include <asm/ptrace.h>
+#include <elf.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/audit.h>
@@ -40,6 +48,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -289,12 +298,41 @@ pass_through:
 }
 
 /*
+ * Set the syscall return register (x0) to -ENOSYS for a stopped tracee.
+ *
+ * When SECCOMP_RET_TRAP fires, the kernel calls syscall_rollback()
+ * which restores x0 to the original first syscall argument (e.g.,
+ * AT_FDCWD = -100 for faccessat2). It does NOT set x0 to -ENOSYS.
+ * We must explicitly set x0 so the child's runtime (e.g., Go's
+ * exec.LookPath) sees -ENOSYS and falls back to allowed syscalls.
+ */
+static int set_return_enosys(pid_t pid) {
+    struct user_pt_regs regs;
+    struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
+
+    if (ptrace(PTRACE_GETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) {
+        fprintf(stderr, "termux-etc-seccomp: PTRACE_GETREGSET failed for "
+                "pid %d: %s\n", (int)pid, strerror(errno));
+        return -1;
+    }
+
+    regs.regs[0] = (unsigned long long)(-ENOSYS);
+    iov.iov_len = sizeof(regs);
+    if (ptrace(PTRACE_SETREGSET, pid, (void *)NT_PRSTATUS, &iov) != 0) {
+        fprintf(stderr, "termux-etc-seccomp: PTRACE_SETREGSET failed for "
+                "pid %d: %s\n", (int)pid, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+/*
  * Drain all pending ptrace events (non-blocking).
  *
  * When Android's seccomp sends SIGSYS for a blocked syscall
- * (e.g., faccessat2), the kernel has already set the syscall return
- * value to -ENOSYS. We suppress the SIGSYS so the child continues
- * with -ENOSYS, allowing Go's runtime to fall back to faccessat.
+ * (e.g., faccessat2), we catch the ptrace stop, explicitly set
+ * x0 to -ENOSYS, and suppress the signal. This allows Go's
+ * runtime to fall back to allowed syscalls (e.g., faccessat).
  *
  * PTRACE_O_TRACECLONE/TRACEFORK/TRACEVFORK ensure all threads
  * and child processes are auto-traced, so SIGSYS is caught
@@ -313,9 +351,15 @@ static void drain_ptrace_events(pid_t main_child,
             if (event != 0) {
                 /* ptrace event (CLONE, EXEC, etc.) — continue */
                 ptrace(PTRACE_CONT, pid, 0, 0);
-            } else if (sig == SIGSYS || sig == SIGSTOP || sig == SIGTRAP) {
-                /* Suppress SIGSYS: kernel already set retval to -ENOSYS.
-                 * Suppress SIGSTOP/SIGTRAP: initial stops for newly
+            } else if (sig == SIGSYS) {
+                /* Set x0 = -ENOSYS and suppress the signal */
+                if (set_return_enosys(pid) != 0)
+                    fprintf(stderr, "termux-etc-seccomp: warning: "
+                            "failed to set -ENOSYS for pid %d, "
+                            "child may see wrong errno\n", (int)pid);
+                ptrace(PTRACE_CONT, pid, 0, 0);
+            } else if (sig == SIGSTOP || sig == SIGTRAP) {
+                /* Suppress SIGSTOP/SIGTRAP: initial stops for newly
                  * traced threads/processes from TRACECLONE/TRACEFORK. */
                 ptrace(PTRACE_CONT, pid, 0, 0);
             } else {
@@ -454,7 +498,7 @@ int main(int argc, char *argv[]) {
      *
      * After each SIGCHLD, drain_ptrace_events() processes all pending
      * ptrace stops:
-     *   - SIGSYS: suppressed (child sees -ENOSYS, falls back gracefully)
+     *   - SIGSYS: x0 set to -ENOSYS, signal suppressed (child falls back)
      *   - CLONE events: new thread, continue immediately
      *   - Other signals: delivered to the child
      *   - Child exit: loop terminates
