@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- fixed SIGSYS handler to explicitly set x0 to `-ENOSYS` via `PTRACE_SETREGSET` instead of relying on the kernel (which restores x0 to the original first argument via `syscall_rollback`, not `-ENOSYS`)
+
 ## [0.2.0] - 2026-03-30
 
 ### Added

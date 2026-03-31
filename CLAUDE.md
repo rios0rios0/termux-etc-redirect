@@ -28,7 +28,7 @@ An `LD_PRELOAD` shared library that intercepts libc functions (`open`, `openat`,
 ### Tier 2: `src/termux-etc-seccomp.c` → `termux-etc-seccomp`
 A hybrid seccomp + ptrace supervisor. Uses two complementary mechanisms:
 1. **seccomp `user_notif`**: Intercepts `openat` syscalls via BPF and redirects `/etc/` paths to `$PREFIX/etc/`.
-2. **ptrace SIGSYS suppression**: Android's seccomp policy blocks certain syscalls (like `faccessat2`) with `SECCOMP_RET_TRAP`, sending SIGSYS. Since the kernel sets the return value to `-ENOSYS` before sending the signal, suppressing SIGSYS via ptrace lets Go's runtime see `-ENOSYS` and fall back to allowed syscalls (e.g., `faccessat`).
+2. **ptrace SIGSYS suppression**: Android's seccomp policy blocks certain syscalls (like `faccessat2`) with `SECCOMP_RET_TRAP`, sending SIGSYS. The kernel calls `syscall_rollback()` which restores x0 to the original first argument (e.g., `AT_FDCWD = -100`), NOT `-ENOSYS`. The ptrace handler catches the SIGSYS stop, explicitly sets x0 to `-ENOSYS` via `PTRACE_SETREGSET`, and suppresses the signal. This lets Go's runtime see `-ENOSYS` and fall back to allowed syscalls (e.g., `faccessat`).
 
 The supervisor forks a child, the child installs the BPF filter and sends the notification fd to the parent via `SCM_RIGHTS` over a Unix socketpair. The parent `PTRACE_SEIZE`s the child with `TRACECLONE|TRACEFORK|TRACEVFORK` to auto-trace all threads and child processes. A `poll()`-based event loop handles both seccomp notifications (openat redirect) and ptrace events (SIGSYS suppression).
 
