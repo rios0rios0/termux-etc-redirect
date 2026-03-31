@@ -7,15 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-03-31
+
 ### Added
 
-- added compile-time `#if !defined(__aarch64__)` guard with `#error` to make the aarch64 requirement explicit at build time
 - added automated `faccessat2` SIGSYS suppression test (`test/test-faccessat2.c`) to `make test` as Tier 3
+- added compile-time `#if !defined(__aarch64__)` guard with `#error` to make the `aarch64` requirement explicit at build time
 
 ### Fixed
 
-- fixed SIGSYS handler to explicitly set x0 to `-ENOSYS` via `PTRACE_SETREGSET` instead of relying on the kernel (which restores x0 to the original first argument via `syscall_rollback`, not `-ENOSYS`)
 - fixed `set_return_enosys()` to check and report `PTRACE_SETREGSET` failures instead of silently ignoring them
+- fixed SIGSYS handler to explicitly set `x0` to `-ENOSYS` via `PTRACE_SETREGSET` instead of relying on the kernel (which restores `x0` to the original first argument via `syscall_rollback`, not `-ENOSYS`)
 
 ## [0.2.0] - 2026-03-30
 
