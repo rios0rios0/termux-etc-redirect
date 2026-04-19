@@ -105,7 +105,7 @@ Same BPF filter as Tier 2, same fd-injection path. The differences are deliberat
 
 - **No ptrace.** A tracer is required on exactly one process at a time; that's fatal for musl binaries like Claude that spawn seccomp-wrapped children or run under `strace`/`gdb`. Without ptrace, Tier 3 composes with any other supervisor.
 - **No SIGSYS rewriting.** Claude's Node/V8 runtime has no fallback for `statx`/`newfstatat` returning `-ENOSYS`; blanket rewriting (Tier 2's approach) produces confusing `ENOSYS: lstat` errors. Tier 3 lets Android's global policy handle SIGSYS natively.
-- **Reentrancy guard.** On startup Tier 3 reads `/proc/self/status`. If `Seccomp:` is non-zero (already wrapped) or `TracerPid:` is non-zero (already traced), it `execvp`s the target directly. An inherited filter is sufficient; a second listener would only add latency.
+- **Reentrancy guard.** Before forking, the supervisor checks `TERMUX_ETC_WRAP_ACTIVE` — the env var it exports into the child immediately before `execve`ing the target. If present, or if `/proc/self/status:TracerPid` is non-zero, Tier 3 `execvp`s the target directly and relies on the outer wrapper's already-installed filter. The `/proc/self/status:Seccomp` field is deliberately not consulted — Android's zygote leaves every Termux process at `Seccomp=2` from an inherited system filter, indistinguishable from "our outer wrapper".
 
 ## When NOT to use this tool
 
