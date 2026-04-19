@@ -9,10 +9,15 @@
  * through direct __syscall — invisible to LD_PRELOAD — and whose Node/V8
  * runtime tolerates no spurious ENOSYS.
  *
- * Tier 3 is also reentrancy-safe: if the process already has a seccomp
- * filter installed (e.g. this wrapper is itself wrapped by Tier 2 or another
- * Tier 3) or is already ptraced, the supervisor machinery is skipped and
- * the target is execve'd directly. The inherited filter keeps redirecting.
+ * Tier 3 is also reentrancy-safe: if an outer wrapper of our own (Tier 2 or
+ * another Tier 3) already installed a redirecting filter, or a debugger has
+ * attached via ptrace, the supervisor machinery is skipped and the target is
+ * execve'd directly. The inherited filter keeps redirecting.
+ *
+ * Detection of "we're already wrapped" uses the TERMUX_ETC_WRAP_ACTIVE env
+ * var, not /proc/self/status: Android's zygote leaves every Termux process
+ * with Seccomp=2 from an inherited system filter, so the proc field cannot
+ * distinguish "our outer wrapper" from "Android's always-on baseline".
  *
  * Usage: termux-etc-mount <command> [args...]
  *
@@ -45,6 +50,17 @@
 #include <unistd.h>
 
 #define TERMUX_DEFAULT_PREFIX "/data/data/com.termux/files/usr"
+
+/*
+ * Env-var marker set by the supervisor before execve'ing the target. Nested
+ * invocations of termux-etc-mount (or termux-etc-seccomp, if the user wants
+ * the two to compose) see this in their environment and short-circuit to a
+ * plain execvp, relying on the outer wrapper's already-installed filter.
+ *
+ * Exported as a name distinct from "ACTIVE" so the meaning is unambiguous:
+ * "an outer termux-etc-* wrapper has already installed a redirecting filter".
+ */
+#define TERMUX_ETC_WRAP_ENV "TERMUX_ETC_WRAP_ACTIVE"
 
 /*
  * Redirect table: source path -> destination suffix (appended to $PREFIX).
@@ -90,20 +106,20 @@ static void build_prefix(void) {
 }
 
 /*
- * Read a single integer field from /proc/self/status. Returns -1 if the
- * field cannot be read; non-negative otherwise. Used to detect an inherited
- * seccomp filter or an attached tracer, either of which indicates that
- * Tier 3 should short-circuit to a direct exec.
+ * Read TracerPid from /proc/self/status. Returns -1 on failure, 0 if no
+ * tracer is attached, otherwise the tracer's pid. A non-zero value means we
+ * can't safely install our own seccomp machinery (the tracer may be delivering
+ * its own responses to the same notify fd, or it may race with our
+ * PTRACE_SEIZE assumptions in child processes).
  */
-static long read_status_field(const char *name) {
+static long read_tracer_pid(void) {
     FILE *f = fopen("/proc/self/status", "r");
     if (!f) return -1;
     char line[256];
-    size_t name_len = strlen(name);
     long value = -1;
     while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, name, name_len) == 0 && line[name_len] == ':') {
-            value = strtol(line + name_len + 1, NULL, 10);
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            value = strtol(line + 10, NULL, 10);
             break;
         }
     }
@@ -324,17 +340,25 @@ int main(int argc, char *argv[]) {
     build_prefix();
 
     /*
-     * Reentrancy guard. If we're already wrapped (by Tier 2, by another
-     * Tier 3, or by any other seccomp-using launcher), the inherited
-     * filter already services our openat redirects. Installing a second
-     * listener fd would force every openat through two supervisors for
-     * no gain and would invite subprocess-collision bugs. Similarly, if
-     * a tracer is attached, we can't safely install our own fd-injection
-     * machinery. Short-circuit to a plain execvp.
+     * Reentrancy guard. Two conditions short-circuit us to a plain execvp:
+     *
+     *   1. TERMUX_ETC_WRAP_ACTIVE is set in our environment. This means an
+     *      outer termux-etc-mount (or termux-etc-seccomp) already installed
+     *      a redirecting filter for this process tree. Stacking another
+     *      listener would double-service every openat and invites
+     *      notification-routing bugs.
+     *
+     *   2. A tracer is attached (TracerPid > 0), e.g. strace or gdb. We
+     *      still install a filter in that case would be safe in principle,
+     *      but Tier 2 historically failed to PTRACE_SEIZE under an outer
+     *      tracer; keeping Tier 3 consistent lets users pick this wrapper
+     *      for debugging sessions too.
+     *
+     * Deliberately NOT checking /proc/self/status:Seccomp — on Termux the
+     * Android zygote leaves every app process at Seccomp=2 from the system
+     * filter, so that field cannot distinguish "our wrapper" from baseline.
      */
-    long seccomp_mode  = read_status_field("Seccomp");
-    long tracer_pid    = read_status_field("TracerPid");
-    if (seccomp_mode > 0 || tracer_pid > 0) {
+    if (getenv(TERMUX_ETC_WRAP_ENV) != NULL || read_tracer_pid() > 0) {
         execvp(argv[1], &argv[1]);
         perror(argv[1]);
         return 127;
@@ -380,6 +404,10 @@ int main(int argc, char *argv[]) {
 
         close(notif_fd);
         close(sock_fds[1]);
+
+        /* Mark the subtree as already-wrapped so nested invocations of
+         * termux-etc-mount / termux-etc-seccomp short-circuit. */
+        setenv(TERMUX_ETC_WRAP_ENV, "1", 1);
 
         execvp(argv[1], &argv[1]);
         perror(argv[1]);

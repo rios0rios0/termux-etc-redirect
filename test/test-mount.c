@@ -5,10 +5,11 @@
  *
  *   1. Under termux-etc-mount, opening /etc/resolv.conf succeeds and yields
  *      the Termux nameservers (same redirect semantics as Tier 1 / Tier 2).
- *   2. The reentrancy guard actually engages: this process sees a seccomp
- *      filter inherited from the Tier 3 supervisor, so a re-exec of the
- *      same wrapper around any trivial child must not install a second
- *      listener fd (which would immediately deadlock or fail with EBUSY).
+ *   2. The reentrancy guard actually engages: the supervisor exports
+ *      TERMUX_ETC_WRAP_ACTIVE=1 into the child's env, and a re-exec of the
+ *      same wrapper around any trivial child must short-circuit to execvp
+ *      instead of installing a second listener fd (which would double-
+ *      service every openat and invite notification-routing bugs).
  *   3. Unrelated /etc/ paths are NOT redirected — /etc/passwd (which
  *      exists on Android) must still be readable with its original content.
  *
@@ -25,22 +26,6 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
-
-static long status_field(const char *name) {
-    FILE *f = fopen("/proc/self/status", "r");
-    if (!f) return -1;
-    char line[256];
-    size_t nlen = strlen(name);
-    long value = -1;
-    while (fgets(line, sizeof(line), f)) {
-        if (strncmp(line, name, nlen) == 0 && line[nlen] == ':') {
-            value = strtol(line + nlen + 1, NULL, 10);
-            break;
-        }
-    }
-    fclose(f);
-    return value;
-}
 
 static int test_resolv_conf_redirect(void) {
     int fd = open("/etc/resolv.conf", O_RDONLY);
@@ -65,14 +50,17 @@ static int test_resolv_conf_redirect(void) {
     return 0;
 }
 
-static int test_seccomp_inherited(void) {
-    long mode = status_field("Seccomp");
-    if (mode <= 0) {
-        fprintf(stderr, "FAIL: expected inherited seccomp filter, Seccomp=%ld\n",
-                mode);
+static int test_wrap_env_var(void) {
+    /* The Tier 3 supervisor exports TERMUX_ETC_WRAP_ACTIVE=1 into the child
+     * env right before execve. If it's absent here, either we were not
+     * launched under the supervisor or the guard wasn't wired up. */
+    const char *v = getenv("TERMUX_ETC_WRAP_ACTIVE");
+    if (!v || strcmp(v, "1") != 0) {
+        fprintf(stderr, "FAIL: TERMUX_ETC_WRAP_ACTIVE missing or wrong (%s)\n",
+                v ? v : "(null)");
         return 1;
     }
-    printf("PASS: seccomp filter inherited (Seccomp=%ld)\n", mode);
+    printf("PASS: TERMUX_ETC_WRAP_ACTIVE=1 exported by supervisor\n");
     return 0;
 }
 
@@ -132,7 +120,7 @@ int main(void) {
     printf("--- termux-etc-mount (Tier 3) integration tests ---\n");
     int rc = 0;
     rc |= test_resolv_conf_redirect();
-    rc |= test_seccomp_inherited();
+    rc |= test_wrap_env_var();
     rc |= test_unrelated_path_not_redirected();
     rc |= test_reentrancy_guard();
     if (rc == 0) printf("--- all tests passed ---\n");
