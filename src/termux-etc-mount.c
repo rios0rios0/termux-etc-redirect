@@ -331,6 +331,16 @@ static void usage(const char *argv0) {
         argv0);
 }
 
+/*
+ * SIGCHLD handler. Sole purpose: interrupt poll() with EINTR so the event
+ * loop can call waitpid(WNOHANG) and notice the supervised child's exit.
+ * Without this the loop deadlocks when the child's final act isn't an
+ * openat — e.g. `cat /etc/resolv.conf` emits one notification then exits;
+ * poll(-1) would block forever on a listener fd that will never fire again.
+ */
+static volatile sig_atomic_t g_sigchld;
+static void sigchld_handler(int sig) { (void)sig; g_sigchld = 1; }
+
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         usage(argv[0]);
@@ -363,6 +373,15 @@ int main(int argc, char *argv[]) {
         perror(argv[1]);
         return 127;
     }
+
+    /* SIGCHLD must interrupt poll() so we can reap a child that exited
+     * without issuing a final openat. Do NOT set SA_RESTART — we need
+     * EINTR delivery. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigchld_handler;
+    sa.sa_flags = 0;
+    sigaction(SIGCHLD, &sa, NULL);
 
     int sock_fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds) < 0) {
