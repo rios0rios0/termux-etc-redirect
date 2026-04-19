@@ -20,10 +20,10 @@ The compiler is clang (`CC ?= clang`). Build artifacts go to `build/`.
 
 ## Architecture
 
-The project has two tiers that share the same redirect table but operate at different levels:
+The project has three tiers that share the same core redirect table but operate at different levels:
 
 ### Tier 1: `src/termux-etc-redirect.c` → `libtermux-etc-redirect.so`
-An `LD_PRELOAD` shared library that intercepts libc functions (`open`, `openat`, `fopen`, `access`, `faccessat`, `stat`, `lstat`) via `dlsym(RTLD_NEXT, ...)`. Works only for dynamically linked binaries. Each intercepted function calls `redirect()` which checks the path against `REDIRECT_TABLE`, builds the Termux-prefixed path, verifies the target exists (via raw syscall to avoid recursion), and returns the rewritten path.
+An `LD_PRELOAD` shared library that intercepts libc functions (`open`, `openat`, `fopen`, `access`, `faccessat`, `stat`, `lstat`) via `dlsym(RTLD_NEXT, ...)`. Works only for dynamically linked bionic/glibc binaries. Each intercepted function calls `redirect()` which checks the path against `REDIRECT_TABLE`, builds the Termux-prefixed path, verifies the target exists (via raw syscall to avoid recursion), and returns the rewritten path.
 
 ### Tier 2: `src/termux-etc-seccomp.c` → `termux-etc-seccomp`
 A hybrid seccomp + ptrace supervisor. Uses two complementary mechanisms:
@@ -32,18 +32,26 @@ A hybrid seccomp + ptrace supervisor. Uses two complementary mechanisms:
 
 The supervisor forks a child, the child installs the BPF filter and sends the notification fd to the parent via `SCM_RIGHTS` over a Unix socketpair. The parent `PTRACE_SEIZE`s the child with `TRACECLONE|TRACEFORK|TRACEVFORK` to auto-trace all threads and child processes. A `poll()`-based event loop handles both seccomp notifications (openat redirect) and ptrace events (SIGSYS suppression).
 
+### Tier 3: `src/termux-etc-mount.c` → `termux-etc-mount`
+A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linux-arm64-musl` build, other Alpine-linked tools). Same BPF filter as Tier 2 (aarch64, `openat`-only) and the same SCM_RIGHTS fd-passing pattern, but:
+- **No ptrace at all.** Avoids the "only one tracer per process" kernel rule, so Tier 3 composes cleanly with `strace`/`gdb`, and a Tier 3 child can spawn a Tier 2 subprocess without collision.
+- **No SIGSYS rewriting.** musl/Node has no fallback for `statx` or `newfstatat` returning `-ENOSYS`; Tier 2's blanket rewrite surfaces as confusing `ENOSYS: lstat` errors in Claude. Tier 3 lets Android's global policy handle SIGSYS natively — Claude and similar workloads never trigger it during normal operation.
+- **Reentrancy guard.** Before forking, the supervisor reads `/proc/self/status`. If `Seccomp:` or `TracerPid:` is non-zero, it `execvp`s the target immediately. An inherited filter from an outer Tier 2 or Tier 3 is sufficient; stacking a second listener would only add latency and invite notification-routing bugs.
+
 ### Key design decisions
 - **Fail-open**: if the Termux destination file doesn't exist, the original path passes through unchanged.
 - **BPF filter is aarch64-only** (`AUDIT_ARCH_AARCH64` hardcoded in the filter).
-- **Redirect table is duplicated** in both source files — changes to redirected paths must be updated in both `src/termux-etc-redirect.c` and `src/termux-etc-seccomp.c`.
+- **Redirect table is duplicated** across Tier 1, Tier 2, and Tier 3 source files — any path change must be applied to all three: `src/termux-etc-redirect.c`, `src/termux-etc-seccomp.c`, `src/termux-etc-mount.c`. Tier 3's table is a superset (adds `/etc/services`).
 - **`$PREFIX` defaults to `/data/data/com.termux/files/usr`** when the environment variable is not set.
-- **ptrace traces all descendants**: `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK` ensures SIGSYS is caught on Go runtime threads and spawned child processes (e.g., `terra` spawning `terragrunt`).
+- **Tier 2 traces all descendants**: `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK` ensures SIGSYS is caught on Go runtime threads and spawned child processes (e.g., `terra` spawning `terragrunt`). Tier 3 deliberately omits this — it relies on inherited seccomp filters instead of tracer ancestry.
 
 ## Testing
 
 - `test/test-redirect.c`: Unit tests for the LD_PRELOAD library. Tests `fopen`, `open`, `access`, `stat` interception and verifies unrelated paths are not redirected. Run via `LD_PRELOAD=build/libtermux-etc-redirect.so build/test-redirect`.
+- `test/test-faccessat2.c`: Validates Tier 2's ptrace SIGSYS-to-ENOSYS rewrite for `faccessat2`. Run via `termux-etc-seccomp build/test-faccessat2`.
+- `test/test-mount.c`: Integration test for Tier 3 — verifies `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, and the reentrancy guard. Run via `termux-etc-mount build/test-mount`.
 - `test/test-terraform/main.tf`: Manual integration test for Terraform TLS via `termux-etc-seccomp terraform init`.
-- The `make test` target runs both the unit test and a seccomp integration test (`termux-etc-seccomp cat /etc/resolv.conf`).
+- `make test` runs all three tiers' unit/integration tests plus a `termux-etc-seccomp cat /etc/resolv.conf` and `termux-etc-mount cat /etc/resolv.conf` smoke test.
 
 ## Target Platform
 
