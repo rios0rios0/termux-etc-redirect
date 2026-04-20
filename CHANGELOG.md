@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - added `examples/claude-code.md` worked example documenting the end-to-end install (musl loader seed + `patchelf --set-interpreter` + Tier 3 wrapper) for Claude Code on Termux
 - added compatibility matrix and "When NOT to use this tool" section to `README.md` covering Tier 2 ptrace-collision failure modes and why Tier 1/2 cannot serve dynamic musl binaries
 
+### Changed
+
+- refreshed `CLAUDE.md` project overview and `Build & Test Commands` block so they describe all three tiers (`libtermux-etc-redirect.so`, `termux-etc-seccomp`, `termux-etc-mount`) instead of only the first two
+
 ## [0.3.0] - 2026-03-31
 
 ### Added

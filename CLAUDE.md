@@ -4,14 +4,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Transparent `/etc/` path redirection for Termux on Android. Enables Go-based CLIs (GitHub CLI, Terraform, Terragrunt, 1Password CLI, kubectl) to resolve DNS and verify TLS certificates without proot. The project provides two complementary C programs that intercept file-access calls and rewrite hardcoded `/etc/` paths to their Termux `$PREFIX/etc/` equivalents.
+Transparent `/etc/` path redirection for Termux on Android. Enables Go-based CLIs (GitHub CLI, Terraform, Terragrunt, 1Password CLI, kubectl) and dynamic musl binaries (Claude Code's `linux-arm64-musl` build) to resolve DNS and verify TLS certificates without proot. The project provides three complementary C programs that intercept file-access calls and rewrite hardcoded `/etc/` paths to their Termux `$PREFIX/etc/` equivalents.
 
 ## Build & Test Commands
 
 ```bash
-make              # Build both the shared library and the seccomp binary
-make test         # Run Tier 1 (LD_PRELOAD) unit tests + Tier 2 (seccomp) integration test
-make install      # Install library to $PREFIX/lib/ and binary to $PREFIX/bin/
+make              # Build all three artifacts: libtermux-etc-redirect.so (Tier 1),
+                  # termux-etc-seccomp (Tier 2), termux-etc-mount (Tier 3)
+make test         # Run Tier 1 (LD_PRELOAD) unit tests, Tier 2 (seccomp + ptrace)
+                  # integration + faccessat2 SIGSYS tests, and Tier 3
+                  # (narrow seccomp) integration + reentrancy-guard tests
+make install      # Install libtermux-etc-redirect.so to $PREFIX/lib/ and both
+                  # termux-etc-seccomp + termux-etc-mount to $PREFIX/bin/
 make clean        # Remove build/ directory
 ./scripts/install.sh  # Full build + install + create missing config files
 ```
