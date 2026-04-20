@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- added Tier 3 `termux-etc-mount` — a narrow seccomp `user_notif` supervisor on `openat` only, with no ptrace and no SIGSYS rewriting, tuned for dynamic musl binaries such as Claude Code's `linux-arm64-musl` build whose libc issues DNS reads via direct `__syscall` and whose Node/V8 runtime tolerates no spurious `ENOSYS`
+- added `/etc/services` to the Tier 3 redirect table (musl's `getservbyname()` data file)
+- added reentrancy guard in `termux-etc-mount`: on startup the supervisor checks the `TERMUX_ETC_WRAP_ACTIVE` environment variable (exported by any outer `termux-etc-*` wrapper immediately before its `execve`) and `/proc/self/status:TracerPid`, short-circuiting to `execvp` if either signal is present. Nested Tier 2 → Tier 3 or Tier 3 → Tier 3 wrappers therefore compose cleanly instead of deadlocking on a duplicate listener fd. The proc `Seccomp` field is deliberately **not** consulted, because Android's zygote leaves every Termux process at `Seccomp=2` from an inherited system filter — a condition indistinguishable from "our outer wrapper"
+- added `test/test-mount.c` integration test covering the `/etc/` redirect, the inherited-filter check, unrelated-path passthrough (validated by comparing `stat` inode+device of `/etc/passwd` against `/system/etc/passwd`), and the reentrancy guard (which resolves the wrapper binary from `/proc/<PPID>/exe` and looks up `true` via `PATH`, so the test stays hermetic without requiring `make install`)
+- added `examples/claude-code.md` worked example documenting the end-to-end install (musl loader seed + `patchelf --set-interpreter` + Tier 3 wrapper) for Claude Code on Termux
+- added compatibility matrix and "When NOT to use this tool" section to `README.md` covering Tier 2 ptrace-collision failure modes and why Tier 1/2 cannot serve dynamic musl binaries
+
+### Changed
+
+- refreshed `CLAUDE.md` project overview and `Build & Test Commands` block so they describe all three tiers (`libtermux-etc-redirect.so`, `termux-etc-seccomp`, `termux-etc-mount`) instead of only the first two
+
 ## [0.3.0] - 2026-03-31
 
 ### Added
