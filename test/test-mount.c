@@ -20,6 +20,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,40 +66,65 @@ static int test_wrap_env_var(void) {
 }
 
 static int test_unrelated_path_not_redirected(void) {
-    /* /etc/passwd exists on Android and is NOT in the redirect table.
-     * Make sure we still get the Android file, not something else. */
-    int fd = open("/etc/passwd", O_RDONLY);
-    if (fd < 0) {
-        /* On some Android versions /etc/passwd is not readable by apps —
-         * tolerate that, just don't claim we redirected. */
-        printf("PASS: /etc/passwd open failed (%s) — not redirected\n",
-               strerror(errno));
-        return 0;
+    /* /etc/passwd exists on Android and is NOT in the Tier 3 redirect table.
+     * Verify we still get the Android file by comparing stat() of /etc/passwd
+     * against /system/etc/passwd (the canonical location /etc aliases to on
+     * modern Android). Equal inode+device means the kernel resolved /etc the
+     * same way it always does — i.e. no redirect happened. Only treat
+     * EACCES as a graceful skip; any other failure is a real test failure. */
+    struct stat st1, st2;
+    if (stat("/etc/passwd", &st1) < 0) {
+        if (errno == EACCES) {
+            printf("PASS: /etc/passwd unreadable (EACCES) — skipped\n");
+            return 0;
+        }
+        fprintf(stderr, "FAIL: stat(/etc/passwd): %s\n", strerror(errno));
+        return 1;
     }
-    char buf[512];
-    ssize_t n = read(fd, buf, sizeof(buf) - 1);
-    close(fd);
-    if (n > 0) {
-        buf[n] = '\0';
-        /* Android passwd starts with "root:" ; we just want to confirm it's
-         * not the Termux file (which is usually absent anyway). */
-        printf("PASS: /etc/passwd readable, not redirected (%zd bytes)\n", n);
-    } else {
-        printf("PASS: /etc/passwd readable but empty (not redirected)\n");
+    if (stat("/system/etc/passwd", &st2) < 0) {
+        fprintf(stderr, "FAIL: stat(/system/etc/passwd): %s\n",
+                strerror(errno));
+        return 1;
     }
+    if (st1.st_ino != st2.st_ino || st1.st_dev != st2.st_dev) {
+        fprintf(stderr, "FAIL: /etc/passwd diverges from /system/etc/passwd "
+                "(ino=%llu/%llu dev=%llu/%llu) — path was redirected\n",
+                (unsigned long long)st1.st_ino,
+                (unsigned long long)st2.st_ino,
+                (unsigned long long)st1.st_dev,
+                (unsigned long long)st2.st_dev);
+        return 1;
+    }
+    printf("PASS: /etc/passwd matches /system/etc/passwd — not redirected\n");
     return 0;
 }
 
 static int test_reentrancy_guard(void) {
-    /* Re-exec termux-etc-mount around /bin/true. If the guard is broken,
-     * this either hangs (double listener) or fails with EPERM/EBUSY. */
+    /* Re-exec the same supervisor around `true`. If the guard is broken,
+     * this either hangs (double listener) or fails with EPERM/EBUSY.
+     *
+     * The wrapper binary is resolved from /proc/<PPID>/exe so the test is
+     * hermetic — it works against build/termux-etc-mount without requiring
+     * `make install` or a specific PATH. The inner command is looked up via
+     * PATH (execvp), which on Termux resolves `true` to $PREFIX/bin/true
+     * regardless of how PREFIX was configured. */
+    char wrapper[PATH_MAX];
+    char link[64];
+    snprintf(link, sizeof(link), "/proc/%d/exe", (int)getppid());
+    ssize_t n = readlink(link, wrapper, sizeof(wrapper) - 1);
+    if (n <= 0) {
+        fprintf(stderr, "FAIL: readlink(%s): %s\n", link, strerror(errno));
+        return 1;
+    }
+    wrapper[n] = '\0';
+
     pid_t pid = fork();
     if (pid < 0) {
         perror("FAIL: fork");
         return 1;
     }
     if (pid == 0) {
-        char *argv[] = { "termux-etc-mount", "/data/data/com.termux/files/usr/bin/true", NULL };
+        char *argv[] = { wrapper, "true", NULL };
         execvp(argv[0], argv);
         _exit(127);
     }
