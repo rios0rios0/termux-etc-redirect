@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- refreshed `.github/copilot-instructions.md` to document all three tiers (`libtermux-etc-redirect.so`, `termux-etc-seccomp`, `termux-etc-mount`) instead of only the first two
+
 ## [0.4.0] - 2026-04-20
 
 ### Added
