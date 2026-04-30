@@ -36,6 +36,8 @@ A hybrid seccomp + ptrace supervisor. Uses two complementary mechanisms:
 
 The supervisor forks a child, the child installs the BPF filter and sends the notification fd to the parent via `SCM_RIGHTS` over a Unix socketpair. The parent `PTRACE_SEIZE`s the child with `TRACECLONE|TRACEFORK|TRACEVFORK` to auto-trace all threads and child processes. A `poll()`-based event loop handles both seccomp notifications (openat redirect) and ptrace events (SIGSYS suppression).
 
+Like Tier 3, Tier 2 also implements a **reentrancy guard**: on startup it checks `TERMUX_ETC_WRAP_ACTIVE` and `/proc/self/status:TracerPid`, and if either is set the supervisor short-circuits to `execvp`. The child exports `TERMUX_ETC_WRAP_ACTIVE=1` before its own `execve`. This means a Tier 3 → Tier 2 chain (e.g. Claude Code launching `op`, whose wrapper invokes `termux-etc-seccomp`) no longer fails with `EBUSY` on the duplicate `SECCOMP_FILTER_FLAG_NEW_LISTENER` install — the inner Tier 2 detects the outer wrapper and inherits its filter.
+
 ### Tier 3: `src/termux-etc-mount.c` → `termux-etc-mount`
 A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linux-arm64-musl` build, other Alpine-linked tools). Same BPF filter as Tier 2 (aarch64, `openat`-only) and the same SCM_RIGHTS fd-passing pattern, but:
 - **No ptrace at all.** Avoids the "only one tracer per process" kernel rule, so Tier 3 composes cleanly with `strace`/`gdb`, and a Tier 3 child can spawn a Tier 2 subprocess without collision.
