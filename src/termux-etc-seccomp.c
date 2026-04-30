@@ -59,6 +59,17 @@
 #define TERMUX_DEFAULT_PREFIX "/data/data/com.termux/files/usr"
 
 /*
+ * Env-var marker shared with Tier 3 (termux-etc-mount). Any termux-etc-*
+ * supervisor sets this in its child's environment immediately before
+ * execve. Nested invocations see it on startup and short-circuit to a
+ * plain execvp, relying on the outer wrapper's already-installed filter.
+ *
+ * The contract is symmetric with src/termux-etc-mount.c — the two tiers
+ * use the same env-var name so they compose in either order.
+ */
+#define TERMUX_ETC_WRAP_ENV "TERMUX_ETC_WRAP_ACTIVE"
+
+/*
  * Redirect table: source path -> destination suffix (appended to $PREFIX).
  * The destination is relative to $PREFIX, so "/etc/hosts" means $PREFIX/etc/hosts.
  *
@@ -86,6 +97,27 @@ static const redirect_entry REDIRECT_TABLE[] = {
 };
 
 static char g_prefix[PATH_MAX];
+
+/*
+ * Read TracerPid from /proc/self/status. Returns -1 on failure, 0 if no
+ * tracer is attached, otherwise the tracer's pid. A non-zero value means
+ * we cannot safely PTRACE_SEIZE the child — only one tracer per task is
+ * allowed by the kernel — so the supervisor must short-circuit to execvp.
+ */
+static long read_tracer_pid(void) {
+    FILE *f = fopen("/proc/self/status", "r");
+    if (!f) return -1;
+    char line[256];
+    long value = -1;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "TracerPid:", 10) == 0) {
+            value = strtol(line + 10, NULL, 10);
+            break;
+        }
+    }
+    fclose(f);
+    return value;
+}
 
 static void build_prefix(void) {
     const char *p = getenv("PREFIX");
@@ -397,6 +429,36 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /*
+     * Reentrancy guard. Two conditions short-circuit to a plain execvp:
+     *
+     *   1. TERMUX_ETC_WRAP_ACTIVE is set — an outer termux-etc-* wrapper
+     *      already installed a redirecting filter for this process tree.
+     *      The kernel allows only one SECCOMP_FILTER_FLAG_NEW_LISTENER
+     *      per task; a second install returns EBUSY. Inheriting the
+     *      outer filter is sufficient to keep /etc/ redirects working.
+     *
+     *   2. A tracer is attached (TracerPid > 0). PTRACE_SEIZE on our
+     *      child below would fail because only one tracer per task is
+     *      allowed. Skip the supervisor and let the existing tracer
+     *      (and any inherited filter) handle redirects.
+     *
+     * Deliberately NOT checking /proc/self/status:Seccomp — Termux's
+     * Android zygote leaves every app process at Seccomp=2 from the
+     * inherited system filter, so that field cannot distinguish "our
+     * outer wrapper" from Android's always-on baseline.
+     *
+     * Run the guard BEFORE build_prefix() so the short-circuit path is
+     * independent of PREFIX validation: a malformed/too-long PREFIX must
+     * not block the pass-through exec when an outer wrapper is already
+     * doing the redirect work for us.
+     */
+    if (getenv(TERMUX_ETC_WRAP_ENV) != NULL || read_tracer_pid() > 0) {
+        execvp(argv[1], &argv[1]);
+        perror(argv[1]);
+        return 127;
+    }
+
     build_prefix();
 
     /* SIGCHLD interrupts poll(), letting us drain ptrace events.
@@ -449,6 +511,10 @@ int main(int argc, char *argv[]) {
 
         close(notif_fd);
         close(sock_fds[1]);
+
+        /* Mark the subtree as already-wrapped so nested invocations of
+         * termux-etc-seccomp / termux-etc-mount short-circuit. */
+        setenv(TERMUX_ETC_WRAP_ENV, "1", 1);
 
         execvp(argv[1], &argv[1]);
         perror(argv[1]);

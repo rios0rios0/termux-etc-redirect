@@ -12,8 +12,9 @@ Transparent `/etc/` path redirection for Termux on Android. Enables Go-based CLI
 make              # Build all three artifacts: libtermux-etc-redirect.so (Tier 1),
                   # termux-etc-seccomp (Tier 2), termux-etc-mount (Tier 3)
 make test         # Run Tier 1 (LD_PRELOAD) unit tests, Tier 2 (seccomp + ptrace)
-                  # integration + faccessat2 SIGSYS tests, and Tier 3
-                  # (narrow seccomp) integration + reentrancy-guard tests
+                  # integration + faccessat2 SIGSYS + reentrancy-guard tests,
+                  # and Tier 3 (narrow seccomp) integration + reentrancy-guard
+                  # tests
 make install      # Install libtermux-etc-redirect.so to $PREFIX/lib/ and both
                   # termux-etc-seccomp + termux-etc-mount to $PREFIX/bin/
 make clean        # Remove build/ directory
@@ -40,7 +41,6 @@ The supervisor forks a child, the child installs the BPF filter and sends the no
 A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linux-arm64-musl` build, other Alpine-linked tools). Same BPF filter as Tier 2 (aarch64, `openat`-only) and the same SCM_RIGHTS fd-passing pattern, but:
 - **No ptrace at all.** Avoids the "only one tracer per process" kernel rule, so Tier 3 composes cleanly with `strace`/`gdb`, and a Tier 3 child can spawn a Tier 2 subprocess without collision.
 - **No SIGSYS rewriting.** musl/Node has no fallback for `statx` or `newfstatat` returning `-ENOSYS`; Tier 2's blanket rewrite surfaces as confusing `ENOSYS: lstat` errors in Claude. Tier 3 lets Android's global policy handle SIGSYS natively — Claude and similar workloads never trigger it during normal operation.
-- **Reentrancy guard.** Before forking, the supervisor checks two signals: the `TERMUX_ETC_WRAP_ACTIVE` environment variable (exported by any outer `termux-etc-*` wrapper immediately before its `execve`) and `/proc/self/status:TracerPid`. If either is non-zero/present, it `execvp`s the target immediately. The proc `Seccomp:` field is deliberately **not** consulted — Termux's zygote leaves every app process at `Seccomp=2` from an inherited system filter, so that field cannot distinguish "our outer wrapper" from Android's always-on baseline. An inherited filter from an outer Tier 2 or Tier 3 is sufficient; stacking a second listener would only add latency and invite notification-routing bugs.
 
 ### Key design decisions
 - **Fail-open**: if the Termux destination file doesn't exist, the original path passes through unchanged.
@@ -48,11 +48,13 @@ A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linu
 - **Redirect table is duplicated** across Tier 1, Tier 2, and Tier 3 source files — any path change must be applied to all three: `src/termux-etc-redirect.c`, `src/termux-etc-seccomp.c`, `src/termux-etc-mount.c`. Tier 3's table is a superset (adds `/etc/services`).
 - **`$PREFIX` defaults to `/data/data/com.termux/files/usr`** when the environment variable is not set.
 - **Tier 2 traces all descendants**: `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK` ensures SIGSYS is caught on Go runtime threads and spawned child processes (e.g., `terra` spawning `terragrunt`). Tier 3 deliberately omits this — it relies on inherited seccomp filters instead of tracer ancestry.
+- **Reentrancy guard (Tier 2 + Tier 3)**: on startup both supervisors check two signals — the `TERMUX_ETC_WRAP_ACTIVE` environment variable (exported by any outer `termux-etc-*` wrapper immediately before its `execve`) and `/proc/self/status:TracerPid`. If either is non-zero/present, the supervisor short-circuits to `execvp` and inherits the outer wrapper's already-installed filter. The kernel allows only one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task, so without this guard nested wrappers (e.g. Tier 3 → Tier 2 when Claude Code launches `op` whose wrapper invokes `termux-etc-seccomp`, or Tier 2 → Tier 2, or Tier 3 → Tier 3) would fail with `EBUSY` on the duplicate listener install. The proc `Seccomp:` field is deliberately **not** consulted — Termux's Android zygote leaves every app process at `Seccomp=2` from an inherited system filter, so that field cannot distinguish "our outer wrapper" from Android's always-on baseline.
 
 ## Testing
 
 - `test/test-redirect.c`: Unit tests for the LD_PRELOAD library. Tests `fopen`, `open`, `access`, `stat` interception and verifies unrelated paths are not redirected. Run via `LD_PRELOAD=build/libtermux-etc-redirect.so build/test-redirect`.
 - `test/test-faccessat2.c`: Validates Tier 2's ptrace SIGSYS-to-ENOSYS rewrite for `faccessat2`. Run via `termux-etc-seccomp build/test-faccessat2`.
+- `test/test-seccomp-reentrancy.c`: Reentrancy-guard test for Tier 2 — verifies that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly (no `EBUSY` on duplicate listener install). Run via `termux-etc-seccomp build/test-seccomp-reentrancy`.
 - `test/test-mount.c`: Integration test for Tier 3 — verifies `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, and the reentrancy guard. Run via `termux-etc-mount build/test-mount`.
 - `test/test-terraform/main.tf`: Manual integration test for Terraform TLS via `termux-etc-seccomp terraform init`.
 - `make test` runs all three tiers' unit/integration tests plus a `termux-etc-seccomp cat /etc/resolv.conf` and `termux-etc-mount cat /etc/resolv.conf` smoke test.

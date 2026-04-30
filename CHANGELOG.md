@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- added reentrancy guard in `termux-etc-seccomp` mirroring Tier 3: on startup the supervisor checks `TERMUX_ETC_WRAP_ACTIVE` and `/proc/self/status:TracerPid`, short-circuiting to `execvp` when either signal is present, and exports `TERMUX_ETC_WRAP_ACTIVE=1` in the child's environment before `execve`. Nested `termux-etc-mount` → `termux-etc-seccomp` (e.g. the `op` wrapper inside Claude Code) and `termux-etc-seccomp` → `termux-etc-seccomp` invocations now compose cleanly instead of failing with `EBUSY` on the duplicate `SECCOMP_FILTER_FLAG_NEW_LISTENER` install
+- added `test/test-seccomp-reentrancy.c` integration test (run as Tier 2's reentrancy stage of `make test`) verifying that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly. The test resolves the wrapper from `/proc/<PPID>/exe` so it stays hermetic without `make install`
+
+### Changed
+
+- moved the `termux-etc-seccomp` reentrancy guard ahead of `build_prefix()` so the short-circuit `execvp` path no longer depends on `PREFIX` validation — a malformed or oversized `PREFIX` can no longer block the pass-through exec when an outer wrapper already redirects `/etc/`
+
 ## [0.4.1] - 2026-04-28
 
 ### Changed

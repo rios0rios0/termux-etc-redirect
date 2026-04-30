@@ -35,7 +35,7 @@ install: all
 clean:
 	rm -rf $(BUILD_DIR)
 
-test: all $(BUILD_DIR)/test-redirect $(BUILD_DIR)/test-faccessat2 $(BUILD_DIR)/test-mount
+test: all $(BUILD_DIR)/test-redirect $(BUILD_DIR)/test-faccessat2 $(BUILD_DIR)/test-mount $(BUILD_DIR)/test-seccomp-reentrancy
 	@echo "=== Tier 1: LD_PRELOAD unit test ==="
 	LD_PRELOAD=$(CURDIR)/$(BUILD_DIR)/$(LIBNAME) $(BUILD_DIR)/test-redirect
 	@echo ""
@@ -44,6 +44,9 @@ test: all $(BUILD_DIR)/test-redirect $(BUILD_DIR)/test-faccessat2 $(BUILD_DIR)/t
 	@echo ""
 	@echo "=== Tier 2: faccessat2 SIGSYS suppression test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) $(BUILD_DIR)/test-faccessat2
+	@echo ""
+	@echo "=== Tier 2: reentrancy guard test ==="
+	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) $(BUILD_DIR)/test-seccomp-reentrancy
 	@echo ""
 	@echo "=== Tier 3: narrow seccomp (no ptrace) integration test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(MOUNTNAME) cat /etc/resolv.conf
@@ -60,4 +63,7 @@ $(BUILD_DIR)/test-faccessat2: test/test-faccessat2.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $<
 
 $(BUILD_DIR)/test-mount: test/test-mount.c | $(BUILD_DIR)
+	$(CC) $(CFLAGS) -o $@ $<
+
+$(BUILD_DIR)/test-seccomp-reentrancy: test/test-seccomp-reentrancy.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -o $@ $<
