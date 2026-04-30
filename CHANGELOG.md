@@ -7,10 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-30
+
 ### Added
 
-- added reentrancy guard in `termux-etc-seccomp` mirroring Tier 3: on startup the supervisor checks `TERMUX_ETC_WRAP_ACTIVE` and `/proc/self/status:TracerPid`, short-circuiting to `execvp` when either signal is present, and exports `TERMUX_ETC_WRAP_ACTIVE=1` in the child's environment before `execve`. Nested `termux-etc-mount` → `termux-etc-seccomp` (e.g. the `op` wrapper inside Claude Code) and `termux-etc-seccomp` → `termux-etc-seccomp` invocations now compose cleanly instead of failing with `EBUSY` on the duplicate `SECCOMP_FILTER_FLAG_NEW_LISTENER` install
 - added `test/test-seccomp-reentrancy.c` integration test (run as Tier 2's reentrancy stage of `make test`) verifying that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly. The test resolves the wrapper from `/proc/<PPID>/exe` so it stays hermetic without `make install`
+- added reentrancy guard in `termux-etc-seccomp` mirroring Tier 3: on startup the supervisor checks `TERMUX_ETC_WRAP_ACTIVE` and `/proc/self/status:TracerPid`, short-circuiting to `execvp` when either signal is present, and exports `TERMUX_ETC_WRAP_ACTIVE=1` in the child's environment before `execve`. Nested `termux-etc-mount` → `termux-etc-seccomp` (e.g. the `op` wrapper inside Claude Code) and `termux-etc-seccomp` → `termux-etc-seccomp` invocations now compose cleanly instead of failing with `EBUSY` on the duplicate `SECCOMP_FILTER_FLAG_NEW_LISTENER` install
 
 ### Changed
 
