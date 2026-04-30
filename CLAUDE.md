@@ -12,8 +12,9 @@ Transparent `/etc/` path redirection for Termux on Android. Enables Go-based CLI
 make              # Build all three artifacts: libtermux-etc-redirect.so (Tier 1),
                   # termux-etc-seccomp (Tier 2), termux-etc-mount (Tier 3)
 make test         # Run Tier 1 (LD_PRELOAD) unit tests, Tier 2 (seccomp + ptrace)
-                  # integration + faccessat2 SIGSYS tests, and Tier 3
-                  # (narrow seccomp) integration + reentrancy-guard tests
+                  # integration + faccessat2 SIGSYS + reentrancy-guard tests,
+                  # and Tier 3 (narrow seccomp) integration + reentrancy-guard
+                  # tests
 make install      # Install libtermux-etc-redirect.so to $PREFIX/lib/ and both
                   # termux-etc-seccomp + termux-etc-mount to $PREFIX/bin/
 make clean        # Remove build/ directory
@@ -55,6 +56,7 @@ A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linu
 
 - `test/test-redirect.c`: Unit tests for the LD_PRELOAD library. Tests `fopen`, `open`, `access`, `stat` interception and verifies unrelated paths are not redirected. Run via `LD_PRELOAD=build/libtermux-etc-redirect.so build/test-redirect`.
 - `test/test-faccessat2.c`: Validates Tier 2's ptrace SIGSYS-to-ENOSYS rewrite for `faccessat2`. Run via `termux-etc-seccomp build/test-faccessat2`.
+- `test/test-seccomp-reentrancy.c`: Reentrancy-guard test for Tier 2 — verifies that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly (no `EBUSY` on duplicate listener install). Run via `termux-etc-seccomp build/test-seccomp-reentrancy`.
 - `test/test-mount.c`: Integration test for Tier 3 — verifies `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, and the reentrancy guard. Run via `termux-etc-mount build/test-mount`.
 - `test/test-terraform/main.tf`: Manual integration test for Terraform TLS via `termux-etc-seccomp terraform init`.
 - `make test` runs all three tiers' unit/integration tests plus a `termux-etc-seccomp cat /etc/resolv.conf` and `termux-etc-mount cat /etc/resolv.conf` smoke test.

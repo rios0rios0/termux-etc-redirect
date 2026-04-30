@@ -429,8 +429,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    build_prefix();
-
     /*
      * Reentrancy guard. Two conditions short-circuit to a plain execvp:
      *
@@ -449,12 +447,19 @@ int main(int argc, char *argv[]) {
      * Android zygote leaves every app process at Seccomp=2 from the
      * inherited system filter, so that field cannot distinguish "our
      * outer wrapper" from Android's always-on baseline.
+     *
+     * Run the guard BEFORE build_prefix() so the short-circuit path is
+     * independent of PREFIX validation: a malformed/too-long PREFIX must
+     * not block the pass-through exec when an outer wrapper is already
+     * doing the redirect work for us.
      */
     if (getenv(TERMUX_ETC_WRAP_ENV) != NULL || read_tracer_pid() > 0) {
         execvp(argv[1], &argv[1]);
         perror(argv[1]);
         return 127;
     }
+
+    build_prefix();
 
     /* SIGCHLD interrupts poll(), letting us drain ptrace events.
      * Do NOT set SA_NOCLDSTOP — we need SIGCHLD for ptrace stops. */
