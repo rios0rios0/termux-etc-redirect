@@ -20,8 +20,8 @@ Compiler: `clang`. Build output: `build/`. No external dependencies beyond libc 
 Three tiers sharing a duplicated redirect table (`REDIRECT_TABLE`):
 
 - **Tier 1** (`src/termux-etc-redirect.c` → `libtermux-etc-redirect.so`): `LD_PRELOAD` library intercepting libc functions (`open`, `openat`, `fopen`, `access`, `faccessat`, `stat`, `lstat`) via `dlsym(RTLD_NEXT, ...)`. Dynamically linked bionic/glibc binaries only.
-- **Tier 2** (`src/termux-etc-seccomp.c` → `termux-etc-seccomp`): Hybrid seccomp `user_notif` + ptrace supervisor. Intercepts `openat` at kernel level via BPF and rewrites `SIGSYS` from Android's `faccessat2` trap to `-ENOSYS` so Go's runtime falls back. Uses `fork` + `SCM_RIGHTS` fd passing + `SECCOMP_IOCTL_NOTIF_ADDFD`. Traces all descendants via `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK`.
-- **Tier 3** (`src/termux-etc-mount.c` → `termux-etc-mount`): Narrow seccomp `user_notif` supervisor for dynamic musl binaries. Same BPF filter as Tier 2 but no ptrace and no SIGSYS rewriting. Composes cleanly with `strace`/`gdb` and nested wrappers. Includes a reentrancy guard (`TERMUX_ETC_WRAP_ACTIVE` env var + `/proc/self/status:TracerPid`) that short-circuits to `execvp` when already wrapped.
+- **Tier 2** (`src/termux-etc-seccomp.c` → `termux-etc-seccomp`): Hybrid seccomp `user_notif` + ptrace supervisor. Intercepts `openat` at kernel level via BPF and rewrites `SIGSYS` from Android's `faccessat2` trap to `-ENOSYS` so Go's runtime falls back. Uses `fork` + `SCM_RIGHTS` fd passing + `SECCOMP_IOCTL_NOTIF_ADDFD`. Traces all descendants via `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK`. Includes a reentrancy guard (`TERMUX_ETC_WRAP_ACTIVE` env var + `/proc/self/status:TracerPid`) that short-circuits to `execvp` when already wrapped; the guard runs before `build_prefix()` so the short-circuit is independent of `PREFIX` validation.
+- **Tier 3** (`src/termux-etc-mount.c` → `termux-etc-mount`): Narrow seccomp `user_notif` supervisor for dynamic musl binaries. Same BPF filter as Tier 2 but no ptrace and no SIGSYS rewriting. Composes cleanly with `strace`/`gdb` and nested wrappers. Same reentrancy guard as Tier 2.
 
 ## Key Constraints
 
@@ -30,12 +30,13 @@ Three tiers sharing a duplicated redirect table (`REDIRECT_TABLE`):
 - **Fail-open design**: if the Termux destination doesn't exist, the original path is used unchanged.
 - `$PREFIX` defaults to `/data/data/com.termux/files/usr`.
 - Tier 1 uses raw `syscall(__NR_faccessat, ...)` to check file existence, avoiding infinite recursion through the intercepted `access()`.
-- Do not wrap Tier 2 inside another tracer or nest Tier 2 inside Tier 2 — ptrace ancestry collides. Use Tier 3 for composable wrapping.
+- Nesting `termux-etc-*` wrappers (Tier 2 → Tier 2, Tier 3 → Tier 2, etc.) is handled by the reentrancy guard — the inner wrapper short-circuits to `execvp` and relies on the outer filter. Wrapping Tier 2 under a non-redirect tracer (e.g. `strace`) also triggers the guard, so no redirects happen; use Tier 3 when you need composable tracing.
 
 ## Testing
 
 - `test/test-redirect.c`: Unit tests for Tier 1 — validates `fopen`, `open`, `access`, `stat` interception and unrelated-path passthrough.
 - `test/test-faccessat2.c`: Validates Tier 2's ptrace SIGSYS-to-ENOSYS rewrite for `faccessat2`.
+- `test/test-seccomp-reentrancy.c`: Validates Tier 2's reentrancy guard — checks `TERMUX_ETC_WRAP_ACTIVE` export and nested invocation short-circuit.
 - `test/test-mount.c`: Integration tests for Tier 3 — validates `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, and reentrancy guard.
 - `make test` runs all three tiers' tests plus smoke tests (`cat /etc/resolv.conf` under both Tier 2 and Tier 3).
 
