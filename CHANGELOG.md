@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-05-19
+
 ### Changed
 
 - refreshed `.github/copilot-instructions.md` to document Tier 2's reentrancy guard, update nesting advice to reflect the guard's short-circuit behavior, and add the missing `test/test-seccomp-reentrancy.c` entry
