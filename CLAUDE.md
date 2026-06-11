@@ -9,14 +9,20 @@ Transparent `/etc/` path redirection for Termux on Android. Enables Go-based CLI
 ## Build & Test Commands
 
 ```bash
-make              # Build all three artifacts: libtermux-etc-redirect.so (Tier 1),
-                  # termux-etc-seccomp (Tier 2), termux-etc-mount (Tier 3)
-make test         # Run Tier 1 (LD_PRELOAD) unit tests, Tier 2 (seccomp + ptrace)
-                  # integration + faccessat2 SIGSYS + reentrancy-guard tests,
-                  # and Tier 3 (narrow seccomp) integration + reentrancy-guard
-                  # tests
-make install      # Install libtermux-etc-redirect.so to $PREFIX/lib/ and both
-                  # termux-etc-seccomp + termux-etc-mount to $PREFIX/bin/
+make              # Build all four artifacts: libtermux-etc-redirect.so (Tier 1),
+                  # termux-etc-seccomp (Tier 2), termux-etc-mount (Tier 3),
+                  # sigsys_launcher (SIGSYS-only ptrace supervisor)
+make test         # Run Tier 1 (LD_PRELOAD) unit tests, Tier 2 (seccomp openat
+                  # redirect + faccessat2 SIGSYS via sigsys_launcher +
+                  # multithreaded clone race via sigsys_launcher +
+                  # reentrancy-guard), and Tier 3 (narrow seccomp) integration
+                  # + reentrancy-guard tests.
+                  # NOTE: Tier 2 SIGSYS tests use sigsys_launcher (not
+                  # termux-etc-seccomp directly) so they work from any
+                  # environment including inside a wrapped shell.
+make install      # Install libtermux-etc-redirect.so to $PREFIX/lib/ and
+                  # termux-etc-seccomp + termux-etc-mount + sigsys_launcher
+                  # to $PREFIX/bin/
 make clean        # Remove build/ directory
 ./scripts/install.sh  # Full build + install + create missing config files
 ```
@@ -35,7 +41,9 @@ A hybrid seccomp + ptrace supervisor. Uses two complementary mechanisms:
 1. **seccomp `user_notif`**: Intercepts `openat` syscalls via BPF and redirects `/etc/` paths to `$PREFIX/etc/`.
 2. **ptrace SIGSYS suppression**: Android's seccomp policy blocks certain syscalls (like `faccessat2`) with `SECCOMP_RET_TRAP`, sending SIGSYS. The kernel calls `syscall_rollback()` which restores x0 to the original first argument (e.g., `AT_FDCWD = -100`), NOT `-ENOSYS`. The ptrace handler catches the SIGSYS stop, explicitly sets x0 to `-ENOSYS` via `PTRACE_SETREGSET`, and suppresses the signal. This lets Go's runtime see `-ENOSYS` and fall back to allowed syscalls (e.g., `faccessat`).
 
-The supervisor forks a child, the child installs the BPF filter and sends the notification fd to the parent via `SCM_RIGHTS` over a Unix socketpair. The parent `PTRACE_SEIZE`s the child with `TRACECLONE|TRACEFORK|TRACEVFORK` to auto-trace all threads and child processes. A `poll()`-based event loop handles both seccomp notifications (openat redirect) and ptrace events (SIGSYS suppression).
+**Race-free ptrace model (TRACEME + blocking waitpid):** The previous `PTRACE_SEIZE` + `poll(notif_fd)` + `SIGCHLD` design raced with Go's rapid `clone()` thread creation — a thread could hit `faccessat2` before its `PTRACE_EVENT_CLONE` stop was drained, causing an unhandled SIGSYS. The current design uses TRACEME + SIGSTOP before exec: the child calls `ptrace(PTRACE_TRACEME)` + `raise(SIGSTOP)` before `execvp`, the parent waits for the stop (blocking), installs `PTRACE_O_TRACECLONE` before any Go thread exists, then continues. Two parent threads run concurrently: (1) the **TRACER thread** (main thread) runs a blocking `waitpid(-1, __WALL)` loop; (2) a **NOTIF thread** runs `poll(notif_fd)` + `handle_notification`. The notif thread is started before the ack is written to the child, so the child's first `execvp`-triggered `openat` always has a consumer.
+
+**Why `SECCOMP_RET_ERRNO` cannot work:** Android's `SECCOMP_RET_TRAP` for `faccessat2` has higher BPF priority than user-installed `SECCOMP_RET_ERRNO` rules — it silently wins. ptrace is the only viable interception mechanism.
 
 ### Tier 3: `src/termux-etc-mount.c` → `termux-etc-mount`
 A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linux-arm64-musl` build, other Alpine-linked tools). Same BPF filter as Tier 2 (aarch64, `openat`-only) and the same SCM_RIGHTS fd-passing pattern, but:
@@ -47,17 +55,18 @@ A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linu
 - **BPF filter is aarch64-only** (`AUDIT_ARCH_AARCH64` hardcoded in the filter).
 - **Redirect table is duplicated** across Tier 1, Tier 2, and Tier 3 source files — any path change must be applied to all three: `src/termux-etc-redirect.c`, `src/termux-etc-seccomp.c`, `src/termux-etc-mount.c`. Tier 3's table is a superset (adds `/etc/services`).
 - **`$PREFIX` defaults to `/data/data/com.termux/files/usr`** when the environment variable is not set.
-- **Tier 2 traces all descendants**: `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK` ensures SIGSYS is caught on Go runtime threads and spawned child processes (e.g., `terra` spawning `terragrunt`). Tier 3 deliberately omits this — it relies on inherited seccomp filters instead of tracer ancestry.
+- **Tier 2 uses TRACEME+blocking waitpid (not PTRACE_SEIZE+poll)**: `PTRACE_TRACEME`+`raise(SIGSTOP)` in the child before `execvp` guarantees `PTRACE_O_TRACECLONE` is installed before any Go runtime thread is cloned. The parent runs a blocking `waitpid(-1, __WALL)` loop on the main thread (all ptrace ops on one OS thread). The old `PTRACE_SEIZE`+`poll(notif_fd)`+`SIGCHLD` design had a race window between `SEIZE` and the first `PTRACE_EVENT_CLONE` stop. `PTRACE_O_TRACECLONE|TRACEFORK|TRACEVFORK` ensures SIGSYS is caught on all Go runtime threads and spawned child processes. Tier 3 deliberately omits ptrace entirely — it relies on inherited seccomp filters.
 - **Reentrancy guard (Tier 2 + Tier 3)**: on startup both supervisors check two signals — the `TERMUX_ETC_WRAP_ACTIVE` environment variable (exported by any outer `termux-etc-*` wrapper immediately before its `execve`) and `/proc/self/status:TracerPid`. If either is non-zero/present, the supervisor short-circuits to `execvp` and inherits the outer wrapper's already-installed filter. The kernel allows only one `SECCOMP_FILTER_FLAG_NEW_LISTENER` per task, so without this guard nested wrappers (e.g. Tier 3 → Tier 2 when Claude Code launches `op` whose wrapper invokes `termux-etc-seccomp`, or Tier 2 → Tier 2, or Tier 3 → Tier 3) would fail with `EBUSY` on the duplicate listener install. The proc `Seccomp:` field is deliberately **not** consulted — Termux's Android zygote leaves every app process at `Seccomp=2` from an inherited system filter, so that field cannot distinguish "our outer wrapper" from Android's always-on baseline.
 
 ## Testing
 
 - `test/test-redirect.c`: Unit tests for the LD_PRELOAD library. Tests `fopen`, `open`, `access`, `stat` interception and verifies unrelated paths are not redirected. Run via `LD_PRELOAD=build/libtermux-etc-redirect.so build/test-redirect`.
-- `test/test-faccessat2.c`: Validates Tier 2's ptrace SIGSYS-to-ENOSYS rewrite for `faccessat2`. Run via `termux-etc-seccomp build/test-faccessat2`.
-- `test/test-seccomp-reentrancy.c`: Reentrancy-guard test for Tier 2 — verifies that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly (no `EBUSY` on duplicate listener install). Run via `termux-etc-seccomp build/test-seccomp-reentrancy`.
+- `test/test-faccessat2.c`: Validates SIGSYS-to-ENOSYS rewrite for a single-threaded `faccessat2` call. Run via `sigsys_launcher build/test-faccessat2` (uses `sigsys_launcher` rather than `termux-etc-seccomp` so the test works from any environment, including from inside an already-wrapped shell where a second `SECCOMP_FILTER_FLAG_NEW_LISTENER` would fail with EBUSY).
+- `test/test-sigsys-threads.c`: Multithreaded regression test for the `clone()` race — 32 threads × 8 direct `faccessat2` syscalls. Verifies that no thread escapes the SIGSYS supervisor before being traced. Run via `sigsys_launcher build/test-sigsys-threads`. The same test run under the old `poll+SIGCHLD` design would exit 159 (SIGSYS kill) — demonstrates the race that motivated the TRACEME+blocking-`waitpid` redesign.
+- `test/test-seccomp-reentrancy.c`: Reentrancy-guard test for Tier 2 — verifies that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly (no `EBUSY` on duplicate listener install). Run via `termux-etc-seccomp build/test-seccomp-reentrancy`. Note: the PPID-based wrapper-binary discovery in this test requires `termux-etc-seccomp` to be the actual supervisor (not short-circuiting via the reentrancy guard), so this test must be run from a fresh terminal that is not already wrapped.
 - `test/test-mount.c`: Integration test for Tier 3 — verifies `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, and the reentrancy guard. Run via `termux-etc-mount build/test-mount`.
 - `test/test-terraform/main.tf`: Manual integration test for Terraform TLS via `termux-etc-seccomp terraform init`.
-- `make test` runs all three tiers' unit/integration tests plus a `termux-etc-seccomp cat /etc/resolv.conf` and `termux-etc-mount cat /etc/resolv.conf` smoke test.
+- `make test` runs all tiers' unit/integration tests. Tier 2 SIGSYS tests use `sigsys_launcher` (not `termux-etc-seccomp` directly) so the full suite can run from inside a wrapped shell.
 
 ## Target Platform
 

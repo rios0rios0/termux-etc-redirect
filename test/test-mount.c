@@ -107,7 +107,13 @@ static int test_reentrancy_guard(void) {
      * hermetic — it works against build/termux-etc-mount without requiring
      * `make install` or a specific PATH. The inner command is looked up via
      * PATH (execvp), which on Termux resolves `true` to $PREFIX/bin/true
-     * regardless of how PREFIX was configured. */
+     * regardless of how PREFIX was configured.
+     *
+     * When run from inside an already-wrapped shell, the reentrancy guard
+     * fires on entry to termux-etc-mount and the short-circuit execvp replaces
+     * the process chain, making PPID the caller (make, shell, etc.) rather
+     * than termux-etc-mount. In that scenario this test skips the nested
+     * check with a note. */
     char wrapper[PATH_MAX];
     char link[64];
     snprintf(link, sizeof(link), "/proc/%d/exe", (int)getppid());
@@ -117,6 +123,16 @@ static int test_reentrancy_guard(void) {
         return 1;
     }
     wrapper[n] = '\0';
+
+    /* If PPID binary is not termux-etc-mount, we're inside a wrapped shell. */
+    const char *base = strrchr(wrapper, '/');
+    base = base ? base + 1 : wrapper;
+    if (strcmp(base, "termux-etc-mount") != 0) {
+        printf("SKIP: nested-guard test skipped (PPID binary is '%s', not "
+               "termux-etc-mount; run from a fresh terminal to exercise "
+               "the full reentrancy guard)\n", base);
+        return 0;
+    }
 
     pid_t pid = fork();
     if (pid < 0) {

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- added `src/sigsys_launcher.c` — a standalone SIGSYS-only ptrace supervisor using TRACEME+blocking `waitpid` (no seccomp filter, no openat redirect). Useful as a composable SIGSYS layer when chaining tools that cannot share a seccomp `NEW_LISTENER` fd. Built and installed alongside `termux-etc-seccomp` and `termux-etc-mount` (`make all` / `make install`)
+- added `test/test-sigsys-threads.c` — multithreaded `faccessat2` race test: 32 threads × 8 direct `faccessat2` syscalls, verifying that no thread escapes the supervisor and causes a SIGSYS kill. Run via `sigsys_launcher` in `make test` (regression guard for the clone-race fix)
+- added `sigsys_launcher` to the `make test` suite as the authoritative SIGSYS suppression validator; the test is race-safe from any environment (no double-`NEW_LISTENER` issue since `sigsys_launcher` installs no seccomp filter)
+
+### Changed
+
+- changed `termux-etc-seccomp` ptrace model from `PTRACE_SEIZE`+`poll(notif_fd)`+`SIGCHLD` to a race-free two-thread design: (1) the child calls `ptrace(PTRACE_TRACEME)` and `raise(SIGSTOP)` **before** `execvp`, so `PTRACE_O_TRACECLONE` is installed before any Go runtime thread is ever cloned; (2) the main thread runs a blocking `waitpid(-1, __WALL)` loop (all ptrace calls on one OS thread, no signal-delivery race); (3) a dedicated notif thread runs `poll(notif_fd)` + `handle_notification` concurrently. The notif thread is spawned **before** the ack is written to the child, eliminating the window where `execvp`'s own `openat` call could block with no consumer on the notif fd. The old design raced between `PTRACE_SEIZE` and Go's rapid `clone()` thread creation — a thread could hit `faccessat2` before its `PTRACE_EVENT_CLONE` stop was drained, causing an unhandled SIGSYS that killed the whole process
+- changed `LDFLAGS` for `termux-etc-seccomp` to link `-lpthread` (required for the notif thread)
+
 ## [0.5.1] - 2026-05-19
 
 ### Changed

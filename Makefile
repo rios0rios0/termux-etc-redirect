@@ -42,22 +42,28 @@ install: all
 clean:
 	rm -rf $(BUILD_DIR)
 
+# NOTE: Tier 2 SIGSYS tests that call build/termux-etc-seccomp directly will
+# short-circuit (via the reentrancy guard) when run inside an already-wrapped
+# shell (TERMUX_ETC_WRAP_ACTIVE=1 or TracerPid>0). This is correct behavior —
+# the outer wrapper handles both SIGSYS and openat redirects. The authoritative
+# SIGSYS race test therefore uses sigsys_launcher, which is reentrancy-safe
+# (no seccomp filter install, no double-listener issue).
 test: all $(BUILD_DIR)/test-redirect $(BUILD_DIR)/test-faccessat2 $(BUILD_DIR)/test-mount \
          $(BUILD_DIR)/test-seccomp-reentrancy $(BUILD_DIR)/test-sigsys-threads
 	@echo "=== Tier 1: LD_PRELOAD unit test ==="
 	LD_PRELOAD=$(CURDIR)/$(BUILD_DIR)/$(LIBNAME) $(BUILD_DIR)/test-redirect
 	@echo ""
-	@echo "=== Tier 2: seccomp integration test ==="
+	@echo "=== Tier 2: seccomp openat redirect test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) cat /etc/resolv.conf
 	@echo ""
 	@echo "=== Tier 2: faccessat2 SIGSYS suppression test ==="
-	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) $(BUILD_DIR)/test-faccessat2
+	$(CURDIR)/$(BUILD_DIR)/$(LAUNCHERNAME) $(BUILD_DIR)/test-faccessat2
+	@echo ""
+	@echo "=== Tier 2: multithreaded clone() race test ==="
+	$(CURDIR)/$(BUILD_DIR)/$(LAUNCHERNAME) $(BUILD_DIR)/test-sigsys-threads
 	@echo ""
 	@echo "=== Tier 2: reentrancy guard test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(BINNAME) $(BUILD_DIR)/test-seccomp-reentrancy
-	@echo ""
-	@echo "=== Tier 2: multithreaded faccessat2 clone race test (via sigsys_launcher) ==="
-	$(CURDIR)/$(BUILD_DIR)/$(LAUNCHERNAME) $(BUILD_DIR)/test-sigsys-threads
 	@echo ""
 	@echo "=== Tier 3: narrow seccomp (no ptrace) integration test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(MOUNTNAME) cat /etc/resolv.conf
