@@ -1,11 +1,14 @@
 /*
  * sigsys_launcher.c - Minimal ptrace-based SIGSYS suppressor for Go on Android
  *
- * Forks a child, ptrace-seizes it with TRACECLONE, and suppresses SIGSYS
- * by rewriting x0 to -ENOSYS on the fly. Uses a BLOCKING waitpid loop
- * instead of poll()+SIGCHLD to avoid the race window.
+ * Forks a child that calls PTRACE_TRACEME + raise(SIGSTOP) before exec, then
+ * the parent installs PTRACE_O_TRACECLONE and suppresses SIGSYS by rewriting
+ * x0 to -ENOSYS on the fly. Uses a BLOCKING waitpid loop instead of
+ * poll()+SIGCHLD to avoid the race window.
  *
  * Usage: sigsys_launcher <binary> [args...]
+ *
+ * SPDX-License-Identifier: Apache-2.0
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,7 +36,7 @@ static int set_return_enosys(pid_t pid) {
     if (ptrace(PTRACE_GETREGSET, pid, (void *)(long)NT_PRSTATUS, &iov) != 0)
         return -1;
 
-    regs.regs[0] = (unsigned long long)(-38LL); /* -ENOSYS */
+    regs.regs[0] = (unsigned long long)(-(long long)ENOSYS);
     iov.iov_len = sizeof(regs);
     if (ptrace(PTRACE_SETREGSET, pid, (void *)(long)NT_PRSTATUS, &iov) != 0)
         return -1;
@@ -66,7 +69,16 @@ int main(int argc, char *argv[]) {
 
     /* Parent: wait for initial SIGSTOP from child */
     int status;
-    waitpid(child, &status, 0);
+    pid_t w;
+    do {
+        w = waitpid(child, &status, 0);
+    } while (w < 0 && errno == EINTR);
+    if (w < 0) {
+        perror("waitpid (initial stop)");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        return 1;
+    }
     if (!WIFSTOPPED(status)) {
         fprintf(stderr, "Expected stop, got status 0x%x\n", status);
         kill(child, SIGKILL);

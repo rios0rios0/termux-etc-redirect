@@ -669,8 +669,13 @@ int main(int argc, char *argv[]) {
                               PTRACE_O_TRACEFORK |
                               PTRACE_O_TRACEVFORK)) != 0) {
         fprintf(stderr, "termux-etc-seccomp: PTRACE_SETOPTIONS failed: %s\n"
-                "SIGSYS suppression disabled\n", strerror(errno));
-        /* Non-fatal: let the child continue without ptrace. */
+                "clone/fork tracing unavailable — SIGSYS suppression on newly "
+                "cloned Go threads is not guaranteed\n", strerror(errno));
+        /*
+         * Non-fatal: the child is still traced via its own PTRACE_TRACEME, so
+         * the main thread's SIGSYS stops are still caught. Only reliable
+         * TRACECLONE/FORK/VFORK coverage of spawned threads/processes is lost.
+         */
     }
 
     /* Release child from its initial SIGSTOP. */
@@ -681,10 +686,11 @@ int main(int argc, char *argv[]) {
      * The child is now running (after PTRACE_CONT) and will install the
      * seccomp filter, send us the fd, then wait for our ack.
      *
-     * Because we sent PTRACE_CONT, the child is executing; it will hit
-     * a ptrace stop for PTRACE_EVENT_SECCOMP or similar events, which
-     * the tracer loop below will service. The socket recv is safe here
-     * because the child explicitly sends the fd then blocks on read().
+     * This recv is a plain blocking SCM_RIGHTS handshake: the child sends
+     * the fd over the socket and then blocks on read() for our ack, so the
+     * ordering is guaranteed by the socket itself, not by ptrace. We do NOT
+     * enable PTRACE_O_TRACESECCOMP, and seccomp USER_NOTIF does not by itself
+     * raise ptrace stops, so no PTRACE_EVENT_SECCOMP occurs here.
      */
     int notif_fd = recv_fd(sock_fds[0]);
     if (notif_fd < 0) {

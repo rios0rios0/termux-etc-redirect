@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
@@ -43,7 +44,7 @@
 #define NUM_THREADS 32
 #define CALLS_PER_THREAD 8
 
-static volatile int g_fail = 0;
+static atomic_int g_fail = 0;
 
 static void *worker(void *arg) {
     (void)arg;
@@ -57,7 +58,7 @@ static void *worker(void *arg) {
          */
         long ret = syscall(__NR_faccessat2, AT_FDCWD, "/proc/self/exe", F_OK, 0);
         if (!(ret == 0 || (ret == -1 && errno == ENOSYS))) {
-            g_fail = 1;
+            atomic_store(&g_fail, 1);
         }
     }
     return NULL;
@@ -79,7 +80,7 @@ int main(void) {
         pthread_join(threads[i], NULL);
     }
 
-    if (g_fail) {
+    if (atomic_load(&g_fail)) {
         printf("FAIL: a faccessat2 call returned an unexpected result\n");
         return 1;
     }
