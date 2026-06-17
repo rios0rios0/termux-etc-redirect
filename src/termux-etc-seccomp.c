@@ -19,6 +19,50 @@
  * Works on ALL binaries, including statically linked Go programs
  * that bypass libc entirely.
  *
+ * DESIGN — race-free ptrace model
+ * ================================
+ * Go's runtime spawns many OS threads (M's) via clone() in rapid succession,
+ * and each thread immediately issues faccessat2 (syscall 439) via
+ * os/exec.LookPath. Android's seccomp policy responds to faccessat2 with
+ * SECCOMP_RET_TRAP, delivering SIGSYS to the calling thread.
+ *
+ * The previous design used PTRACE_SEIZE from the parent *after* fork(),
+ * combined with a poll(notif_fd) + SIGCHLD event loop. This creates a
+ * race window: new threads cloned between the fork() and PTRACE_SEIZE
+ * are not yet traced. If such a thread hits faccessat2 before the parent
+ * processes its PTRACE_EVENT_CLONE stop, the unhandled SIGSYS kills the
+ * whole process.
+ *
+ * The fix uses the classical TRACEME+SIGSTOP approach:
+ *
+ *   Child: ptrace(PTRACE_TRACEME) → raise(SIGSTOP)          [before execvp]
+ *   Parent: waitpid(child) for that stop                     [blocking]
+ *           ptrace(PTRACE_SETOPTIONS, TRACECLONE|…)          [before exec]
+ *           → ack child to continue → execvp runs
+ *
+ * Because PTRACE_O_TRACECLONE is set *before* execvp, every clone() the
+ * Go runtime issues after exec is intercepted atomically — there is no
+ * window between clone() and tracing.
+ *
+ * Two parent threads run concurrently after setup:
+ *   TRACER thread: blocking waitpid(-1, __WALL) loop — handles SIGSYS,
+ *                  CLONE/FORK events, and child exit. Must stay on the
+ *                  same OS thread that called PTRACE_SETOPTIONS (Linux
+ *                  ptrace requires all ptrace calls on one thread).
+ *   NOTIF thread:  poll(notif_fd) loop — handles openat() USER_NOTIF
+ *                  redirects. Runs concurrently with no ptrace calls.
+ *
+ * Why a pure seccomp SECCOMP_RET_ERRNO filter CANNOT work
+ * ========================================================
+ * Android's per-process seccomp policy uses SECCOMP_RET_TRAP for
+ * faccessat2. BPF filter rules are composed with OR-priority semantics:
+ * the *highest-priority* matching action wins. SECCOMP_RET_TRAP (0x00030000)
+ * outranks SECCOMP_RET_ERRNO (0x00050000 — confusingly, lower numeric value
+ * means higher priority). A user-installed SECCOMP_RET_ERRNO|ENOSYS rule for
+ * faccessat2 is therefore silently overridden by Android's TRAP rule.
+ * ptrace interception of the resulting SIGSYS is the only mechanism that
+ * can intercept and redirect the signal after the kernel has already acted.
+ *
  * Usage: termux-etc-seccomp <command> [args...]
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -37,6 +81,7 @@
 #include <linux/limits.h>
 #include <linux/seccomp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -54,6 +99,10 @@
 
 #ifndef __WALL
 #define __WALL 0x40000000
+#endif
+
+#ifndef NT_PRSTATUS
+#define NT_PRSTATUS 1
 #endif
 
 #define TERMUX_DEFAULT_PREFIX "/data/data/com.termux/files/usr"
@@ -101,8 +150,9 @@ static char g_prefix[PATH_MAX];
 /*
  * Read TracerPid from /proc/self/status. Returns -1 on failure, 0 if no
  * tracer is attached, otherwise the tracer's pid. A non-zero value means
- * we cannot safely PTRACE_SEIZE the child — only one tracer per task is
- * allowed by the kernel — so the supervisor must short-circuit to execvp.
+ * we are already being traced — we cannot safely PTRACE_TRACEME in the
+ * child (only one tracer per task), so the supervisor must short-circuit
+ * to execvp and let the outer tracer handle SIGSYS.
  */
 static long read_tracer_pid(void) {
     FILE *f = fopen("/proc/self/status", "r");
@@ -358,60 +408,114 @@ static int set_return_enosys(pid_t pid) {
     return 0;
 }
 
-/*
- * Drain all pending ptrace events (non-blocking).
- *
- * When Android's seccomp sends SIGSYS for a blocked syscall
- * (e.g., faccessat2), we catch the ptrace stop, explicitly set
- * x0 to -ENOSYS, and suppress the signal. This allows Go's
- * runtime to fall back to allowed syscalls (e.g., faccessat).
- *
- * PTRACE_O_TRACECLONE/TRACEFORK/TRACEVFORK ensure all threads
- * and child processes are auto-traced, so SIGSYS is caught
- * everywhere (Go runtime threads + spawned subprocesses).
- */
-static void drain_ptrace_events(pid_t main_child,
-                                int *main_exited, int *exit_status) {
-    int status;
-    pid_t pid;
+/* -----------------------------------------------------------------------
+ * NOTIF thread: polls the seccomp notification fd and services openat()
+ * redirects. Runs concurrently with the tracer loop on the main thread.
+ * ----------------------------------------------------------------------- */
 
-    while ((pid = waitpid(-1, &status, WNOHANG | __WALL)) > 0) {
-        if (WIFSTOPPED(status)) {
-            int sig = WSTOPSIG(status);
-            unsigned int event = (unsigned int)status >> 16;
+struct notif_thread_args {
+    int notif_fd;
+};
 
-            if (event != 0) {
-                /* ptrace event (CLONE, EXEC, etc.) — continue */
-                ptrace(PTRACE_CONT, pid, 0, 0);
-            } else if (sig == SIGSYS) {
-                /* Set x0 = -ENOSYS and suppress the signal */
-                if (set_return_enosys(pid) != 0)
-                    fprintf(stderr, "termux-etc-seccomp: warning: "
-                            "failed to set -ENOSYS for pid %d, "
-                            "child may see wrong errno\n", (int)pid);
-                ptrace(PTRACE_CONT, pid, 0, 0);
-            } else if (sig == SIGSTOP || sig == SIGTRAP) {
-                /* Suppress SIGSTOP/SIGTRAP: initial stops for newly
-                 * traced threads/processes from TRACECLONE/TRACEFORK. */
-                ptrace(PTRACE_CONT, pid, 0, 0);
-            } else {
-                /* Deliver other signals normally */
-                ptrace(PTRACE_CONT, pid, 0, sig);
-            }
-        } else if (WIFEXITED(status) || WIFSIGNALED(status)) {
-            if (pid == main_child) {
-                *main_exited = 1;
-                *exit_status = status;
+static void *notif_thread_func(void *arg) {
+    struct notif_thread_args *a = (struct notif_thread_args *)arg;
+    int notif_fd = a->notif_fd;
+    free(a);
+
+    while (1) {
+        struct pollfd pfd = { .fd = notif_fd, .events = POLLIN };
+        int ret = poll(&pfd, 1, -1);
+
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            /* EBADF / EINVAL: notif_fd was closed — child exited */
+            break;
+        }
+
+        if (ret > 0) {
+            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+                break;
+            if (pfd.revents & POLLIN) {
+                int hn_ret = handle_notification(notif_fd);
+                if (hn_ret < 0) {
+                    fprintf(stderr, "termux-etc-seccomp: "
+                            "handle_notification() failed\n");
+                    break;
+                }
             }
         }
     }
+
+    return NULL;
 }
 
-static volatile sig_atomic_t g_sigchld = 0;
+/* -----------------------------------------------------------------------
+ * TRACER loop (main thread): blocking waitpid(-1, __WALL).
+ *
+ * All ptrace calls MUST happen on the same OS thread that initially
+ * called ptrace(PTRACE_SETOPTIONS, …). We lock this to the main thread
+ * by never spawning a separate tracer thread — the main thread runs
+ * this loop directly after launching the notif thread.
+ * ----------------------------------------------------------------------- */
 
-static void sigchld_handler(int sig) {
-    (void)sig;
-    g_sigchld = 1;
+static void tracer_loop(pid_t main_child, int *exit_status_out) {
+    int status;
+    pid_t pid;
+    int main_exited = 0;
+    int exit_status = 0;
+
+    while (!main_exited) {
+        pid = waitpid(-1, &status, __WALL);
+        if (pid < 0) {
+            if (errno == EINTR) continue;
+            if (errno == ECHILD) break;
+            perror("termux-etc-seccomp: waitpid");
+            break;
+        }
+
+        if (WIFEXITED(status) || WIFSIGNALED(status)) {
+            if (pid == main_child) {
+                main_exited = 1;
+                exit_status = status;
+            }
+            /* Thread/subprocess exits: nothing to do, don't ptrace. */
+            continue;
+        }
+
+        if (!WIFSTOPPED(status)) continue;
+
+        int sig = WSTOPSIG(status);
+        unsigned int event = (unsigned int)status >> 16;
+
+        if (event != 0) {
+            /* ptrace event (CLONE, FORK, VFORK, EXEC, …): continue. */
+            ptrace(PTRACE_CONT, pid, 0, 0);
+        } else if (sig == SIGSYS) {
+            /*
+             * SIGSYS from Android's SECCOMP_RET_TRAP: rewrite x0 to
+             * -ENOSYS and suppress the signal so Go's runtime falls back.
+             */
+            if (set_return_enosys(pid) != 0)
+                fprintf(stderr, "termux-etc-seccomp: warning: "
+                        "failed to set -ENOSYS for pid %d, "
+                        "child may see wrong errno\n", (int)pid);
+            ptrace(PTRACE_CONT, pid, 0, 0); /* suppress signal */
+        } else if (sig == SIGSTOP || sig == SIGTRAP) {
+            /*
+             * Initial stop for newly traced threads/processes arriving
+             * via PTRACE_O_TRACECLONE/TRACEFORK. Suppress and continue.
+             */
+            ptrace(PTRACE_CONT, pid, 0, 0);
+        } else {
+            /* Deliver other signals normally. */
+            ptrace(PTRACE_CONT, pid, 0, sig);
+        }
+    }
+
+    /* Reap any stray children. */
+    while (waitpid(-1, NULL, WNOHANG | __WALL) > 0) {}
+
+    *exit_status_out = exit_status;
 }
 
 static void usage(const char *argv0) {
@@ -438,10 +542,12 @@ int main(int argc, char *argv[]) {
      *      per task; a second install returns EBUSY. Inheriting the
      *      outer filter is sufficient to keep /etc/ redirects working.
      *
-     *   2. A tracer is attached (TracerPid > 0). PTRACE_SEIZE on our
-     *      child below would fail because only one tracer per task is
-     *      allowed. Skip the supervisor and let the existing tracer
-     *      (and any inherited filter) handle redirects.
+     *   2. A tracer is attached (TracerPid > 0). With TRACEME, the child
+     *      would call ptrace(PTRACE_TRACEME) but the kernel rejects it if
+     *      the parent is already traced (the grandparent's tracer would
+     *      own the parent, and TRACEME attaches the child's parent as
+     *      its tracer — only one tracer per task is permitted). Skip the
+     *      supervisor and let the existing tracer handle SIGSYS.
      *
      * Deliberately NOT checking /proc/self/status:Seccomp — Termux's
      * Android zygote leaves every app process at Seccomp=2 from the
@@ -461,14 +567,6 @@ int main(int argc, char *argv[]) {
 
     build_prefix();
 
-    /* SIGCHLD interrupts poll(), letting us drain ptrace events.
-     * Do NOT set SA_NOCLDSTOP — we need SIGCHLD for ptrace stops. */
-    struct sigaction sa;
-    memset(&sa, 0, sizeof(sa));
-    sa.sa_handler = sigchld_handler;
-    sa.sa_flags = 0;
-    sigaction(SIGCHLD, &sa, NULL);
-
     /* Unix socketpair for passing the seccomp notif fd via SCM_RIGHTS. */
     int sock_fds[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sock_fds) < 0) {
@@ -485,6 +583,18 @@ int main(int argc, char *argv[]) {
     if (child == 0) {
         /* --- Child --- */
         close(sock_fds[0]);
+
+        /*
+         * TRACEME + SIGSTOP before exec: registers this process as a
+         * tracee of the parent, then stops to let the parent install
+         * PTRACE_O_TRACECLONE before any Go thread is ever spawned.
+         * This is the key to race-free clone() interception.
+         */
+        if (ptrace(PTRACE_TRACEME, 0, 0, 0) != 0) {
+            perror("termux-etc-seccomp: ptrace TRACEME");
+            _exit(1);
+        }
+        raise(SIGSTOP);
 
         if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0) {
             perror("termux-etc-seccomp: prctl(NO_NEW_PRIVS)");
@@ -524,31 +634,104 @@ int main(int argc, char *argv[]) {
     /* --- Parent (supervisor) --- */
     close(sock_fds[1]);
 
+    /*
+     * Wait for the child's initial SIGSTOP from PTRACE_TRACEME.
+     * This is a blocking wait — we MUST receive this stop before
+     * calling PTRACE_SETOPTIONS so that the options are installed
+     * before the child proceeds to exec and spawns Go threads.
+     */
+    int init_status;
+    if (waitpid(child, &init_status, 0) < 0) {
+        perror("termux-etc-seccomp: waitpid (initial stop)");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        close(sock_fds[0]);
+        return 1;
+    }
+
+    if (!WIFSTOPPED(init_status)) {
+        fprintf(stderr, "termux-etc-seccomp: expected initial stop, "
+                "got status 0x%x\n", init_status);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        close(sock_fds[0]);
+        return 1;
+    }
+
+    /*
+     * Install ptrace options BEFORE child continues.
+     * TRACECLONE ensures every Go runtime thread is auto-traced the
+     * instant it is cloned — no race window exists because SIGSTOP
+     * is still pending and the child hasn't called execvp yet.
+     */
+    if (ptrace(PTRACE_SETOPTIONS, child, 0,
+               (void *)(long)(PTRACE_O_TRACECLONE |
+                              PTRACE_O_TRACEFORK |
+                              PTRACE_O_TRACEVFORK)) != 0) {
+        fprintf(stderr, "termux-etc-seccomp: PTRACE_SETOPTIONS failed: %s\n"
+                "clone/fork tracing unavailable — SIGSYS suppression on newly "
+                "cloned Go threads is not guaranteed\n", strerror(errno));
+        /*
+         * Non-fatal: the child is still traced via its own PTRACE_TRACEME, so
+         * the main thread's SIGSYS stops are still caught. Only reliable
+         * TRACECLONE/FORK/VFORK coverage of spawned threads/processes is lost.
+         */
+    }
+
+    /* Release child from its initial SIGSTOP. */
+    ptrace(PTRACE_CONT, child, 0, 0);
+
+    /*
+     * Receive the seccomp notif fd from the child.
+     * The child is now running (after PTRACE_CONT) and will install the
+     * seccomp filter, send us the fd, then wait for our ack.
+     *
+     * This recv is a plain blocking SCM_RIGHTS handshake: the child sends
+     * the fd over the socket and then blocks on read() for our ack, so the
+     * ordering is guaranteed by the socket itself, not by ptrace. We do NOT
+     * enable PTRACE_O_TRACESECCOMP, and seccomp USER_NOTIF does not by itself
+     * raise ptrace stops, so no PTRACE_EVENT_SECCOMP occurs here.
+     */
     int notif_fd = recv_fd(sock_fds[0]);
     if (notif_fd < 0) {
         fprintf(stderr, "termux-etc-seccomp: failed to receive notif fd\n");
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
+        close(sock_fds[0]);
         return 1;
     }
 
-    /* Ptrace-seize the child BEFORE ack (before exec).
-     * TRACECLONE auto-traces new threads (Go runtime M's).
-     * TRACEFORK/TRACEVFORK auto-traces child processes spawned
-     * via os/exec.Command (e.g., terra → terragrunt). */
-    int ptrace_ok = 0;
-    if (ptrace(PTRACE_SEIZE, child, 0,
-               (void *)(long)(PTRACE_O_TRACECLONE |
-                              PTRACE_O_TRACEFORK |
-                              PTRACE_O_TRACEVFORK)) == 0) {
-        ptrace_ok = 1;
-    } else {
-        fprintf(stderr,
-                "termux-etc-seccomp: ptrace seize failed (%s), "
-                "SIGSYS suppression disabled\n", strerror(errno));
+    /*
+     * Spawn the NOTIF thread BEFORE acknowledging the child.
+     *
+     * The child's first execvp() call opens the binary via openat(), which
+     * triggers the USER_NOTIF filter immediately. If the notif thread is not
+     * already polling when the child receives the ack and calls execvp(), the
+     * kernel-queued notification has no consumer and the child blocks
+     * indefinitely. Starting the thread before the ack eliminates this race.
+     */
+    struct notif_thread_args *nta = malloc(sizeof(*nta));
+    if (!nta) {
+        fprintf(stderr, "termux-etc-seccomp: malloc failed\n");
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        close(notif_fd);
+        return 1;
     }
+    nta->notif_fd = notif_fd;
 
-    /* Acknowledge so child can proceed to exec. */
+    pthread_t notif_tid;
+    if (pthread_create(&notif_tid, NULL, notif_thread_func, nta) != 0) {
+        perror("termux-etc-seccomp: pthread_create");
+        free(nta);
+        kill(child, SIGKILL);
+        waitpid(child, NULL, 0);
+        close(notif_fd);
+        return 1;
+    }
+    pthread_detach(notif_tid);
+
+    /* Acknowledge so child can proceed to execvp. */
     char ack = 'A';
     if (write(sock_fds[0], &ack, 1) < 0) {
         /* Best-effort; child will proceed anyway on socket close. */
@@ -556,59 +739,20 @@ int main(int argc, char *argv[]) {
     close(sock_fds[0]);
 
     /*
-     * Main event loop.
+     * TRACER LOOP (main thread, blocking waitpid).
      *
-     * poll() on the seccomp notif fd blocks until either:
-     *   - An openat() notification arrives (POLLIN)
-     *   - SIGCHLD fires (EINTR), signaling a ptrace stop or child exit
-     *
-     * After each SIGCHLD, drain_ptrace_events() processes all pending
-     * ptrace stops:
-     *   - SIGSYS: x0 set to -ENOSYS, signal suppressed (child falls back)
-     *   - CLONE events: new thread, continue immediately
+     * Handles all ptrace events:
+     *   - SIGSYS: x0 set to -ENOSYS, signal suppressed
+     *   - CLONE/FORK events: new thread/process, continue immediately
      *   - Other signals: delivered to the child
      *   - Child exit: loop terminates
      */
-    int main_exited = 0;
     int exit_status = 0;
+    tracer_loop(child, &exit_status);
 
-    while (!main_exited) {
-        if (ptrace_ok)
-            drain_ptrace_events(child, &main_exited, &exit_status);
-        if (main_exited) break;
-
-        struct pollfd pfd = { .fd = notif_fd, .events = POLLIN };
-        int ret = poll(&pfd, 1, -1);
-
-        if (ret < 0) {
-            if (errno == EINTR) continue;
-            if (errno == EBADF || errno == EINVAL) break;
-            continue;
-        }
-
-        if (ret > 0) {
-            /* If the seccomp notif fd becomes unusable, exit the loop
-             * so the supervisor can clean up instead of spinning. */
-            if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
-                break;
-            }
-            if (pfd.revents & POLLIN) {
-                int hn_ret = handle_notification(notif_fd);
-                if (hn_ret < 0) {
-                    fprintf(stderr, "termux-etc-seccomp: handle_notification() failed, exiting event loop\n");
-                    break;
-                }
-            }
-        }
-    }
-
+    /* Signal the notif thread to exit by closing notif_fd.
+     * poll() will return POLLHUP/POLLERR and the thread will exit. */
     close(notif_fd);
-
-    /* If we didn't collect the exit status from ptrace events
-     * (e.g., ptrace was not available), collect it now. */
-    if (!main_exited) {
-        waitpid(child, &exit_status, 0);
-    }
 
     if (WIFEXITED(exit_status))
         return WEXITSTATUS(exit_status);

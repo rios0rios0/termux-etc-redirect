@@ -96,8 +96,32 @@ Intercepts libc functions (`open`, `openat`, `fopen`, `access`, `stat`, `lstat`,
 
 1. Installs a BPF filter targeting `openat` with `SECCOMP_RET_USER_NOTIF`; everything else is `ALLOW`.
 2. Non-matching syscalls pass through the kernel at full speed.
-3. For matching `openat` calls, the supervisor reads the path from the child's memory, opens the Termux file, and injects the fd back into the child via `SECCOMP_IOCTL_NOTIF_ADDFD`.
-4. A ptrace handler catches Android's own `SECCOMP_RET_TRAP → SIGSYS` on blocked syscalls (e.g. `faccessat2`), sets x0 to `-ENOSYS` via `PTRACE_SETREGSET`, and suppresses the signal so the child's runtime falls back to an allowed syscall.
+3. For matching `openat` calls, a dedicated notif thread reads the path from the child's memory, opens the Termux file, and injects the fd back into the child via `SECCOMP_IOCTL_NOTIF_ADDFD`.
+4. A ptrace handler (main thread, blocking `waitpid`) catches Android's own `SECCOMP_RET_TRAP → SIGSYS` on blocked syscalls (e.g. `faccessat2`), sets x0 to `-ENOSYS` via `PTRACE_SETREGSET`, and suppresses the signal so the child's runtime falls back to an allowed syscall.
+
+#### Why the clone() race matters — and how Tier 2 avoids it
+
+Go's runtime spawns OS threads (`M`s) via `clone()` in rapid succession, and each new thread immediately calls `faccessat2` via `os/exec.LookPath`. Android's seccomp policy responds to `faccessat2` with `SECCOMP_RET_TRAP → SIGSYS`.
+
+The naive approach (`PTRACE_SEIZE` after `fork`, combined with a `poll + SIGCHLD` loop) creates a race window: if a new thread is cloned between the `fork` and the parent processing the `PTRACE_EVENT_CLONE` stop, that thread hits `faccessat2` before it is traced. The unhandled SIGSYS kills the whole process.
+
+Tier 2 uses TRACEME + SIGSTOP before exec to close this window:
+
+```
+Child:  ptrace(PTRACE_TRACEME) → raise(SIGSTOP)           [before execvp]
+Parent: waitpid(child) for stop → PTRACE_SETOPTIONS(TRACECLONE|…) → PTRACE_CONT
+```
+
+Because `PTRACE_O_TRACECLONE` is set *before* `execvp`, every `clone()` the Go runtime issues after exec is intercepted atomically — no race window exists.
+
+The two parent threads run concurrently after setup:
+
+- **TRACER thread** (main thread): blocking `waitpid(-1, __WALL)`. All ptrace calls stay on the OS thread that called `PTRACE_SETOPTIONS`. Handles SIGSYS, CLONE events, and child exit.
+- **NOTIF thread**: `poll(notif_fd)` loop for `openat` USER\_NOTIF redirects. No ptrace calls, runs concurrently.
+
+#### Why a pure seccomp SECCOMP\_RET\_ERRNO filter cannot work
+
+Android's per-process seccomp policy uses `SECCOMP_RET_TRAP` for `faccessat2`. BPF filter rules use highest-priority-wins semantics: `SECCOMP_RET_TRAP` (priority 3) outranks `SECCOMP_RET_ERRNO` (priority 5 — lower numeric value wins). A user-installed `SECCOMP_RET_ERRNO|ENOSYS` rule for `faccessat2` is silently overridden by Android's `TRAP` rule. ptrace interception of the resulting SIGSYS is the only mechanism that can intercept and redirect the signal after the kernel has already acted.
 
 ### Tier 3: narrow seccomp user_notif, no ptrace
 
