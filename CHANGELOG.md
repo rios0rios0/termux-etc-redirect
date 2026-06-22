@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- refreshed `.github/copilot-instructions.md` to document the `sigsys_launcher` artifact, the TRACEME + blocking-`waitpid` race-free ptrace model, and the `test/test-sigsys-threads.c` multithreaded clone-race test added in 0.6.0; corrected the build/install commands to reflect four artifacts and three installed binaries
+
 ## [0.6.0] - 2026-06-18
 
 ### Added
