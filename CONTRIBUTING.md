@@ -9,6 +9,7 @@ development practices, refer to the **[Development Guide](https://github.com/rio
 
 - Termux on Android (aarch64)
 - [Make](https://www.gnu.org/software/make/)
+- [Go](https://go.dev/dl/) (`pkg install golang`) — needed only to install `chlog`
 - [chlog](https://github.com/luizjhonata/chlog) (`go install github.com/luizjhonata/chlog@latest`)
 - clang (`pkg install clang`)
 
