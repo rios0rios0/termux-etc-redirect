@@ -9,6 +9,8 @@ development practices, refer to the **[Development Guide](https://github.com/rio
 
 - Termux on Android (aarch64)
 - [Make](https://www.gnu.org/software/make/)
+- [Go](https://go.dev/dl/) (`pkg install golang`) — needed only to install `chlog`
+- [chlog](https://github.com/luizjhonata/chlog) (`go install github.com/luizjhonata/chlog@latest`)
 - clang (`pkg install clang`)
 
 ## Development Workflow
@@ -24,6 +26,9 @@ development practices, refer to the **[Development Guide](https://github.com/rio
    ```bash
    make test
    ```
-6. Update `CHANGELOG.md` under `[Unreleased]`
+6. Add a changelog fragment — never edit `CHANGELOG.md`, which is generated from them:
+   ```bash
+   chlog new --kind Added --body "added the thing that was not there before"
+   ```
 7. Commit following the [commit conventions](https://github.com/rios0rios0/guide/wiki/Git-Flow)
 8. Open a pull request against `main`
