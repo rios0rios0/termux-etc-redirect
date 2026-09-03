@@ -86,10 +86,10 @@ termux-etc-mount ~/.local/share/claude/versions/<version> -p "say ok"
 
 Tier 3 is ptrace-free and does **not** rewrite SIGSYS. Its BPF filter is identical to Tier 2's (openat-only on aarch64), but the supervisor is simpler and safer to nest inside other tracers. See `examples/claude-code.md` for an end-to-end Claude Code walkthrough.
 
-Tier 3 also moves `LD_PRELOAD` out of the target's way. Termux exports it for every session so that `termux-exec` can rewrite `#!/usr/bin/env` and `#!/bin/sh` shebangs on `execve`, and it is how Tier 1 is enabled — but both shims are bionic, and a musl loader treats an entry it cannot relocate as fatal. Unsetting the variable would leave every bionic process the target spawns without the shims too (each `#!/usr/bin/env` script then fails with exit 127), so the wrapper parks it instead: the value is copied to `TERMUX_ETC_LD_PRELOAD` and removed. Restore it for bionic descendants from your shell's rc file, which the target's tool calls source and the target itself never does:
+Tier 3 also moves `LD_PRELOAD` out of the target's way. Termux exports it for every session so that `termux-exec` can rewrite `#!/usr/bin/env` and `#!/bin/sh` shebangs on `execve`, and it is how Tier 1 is enabled — but both shims are bionic, and a musl loader treats an entry it cannot relocate as fatal. Unsetting the variable would leave every bionic process the target spawns without the shims too (each `#!/usr/bin/env` script then fails with exit 127), so the wrapper parks it instead: the value is copied to `TERMUX_ETC_LD_PRELOAD` and removed. Restore it for bionic descendants from a file every shell the target spawns reads, which the target itself never does: `~/.zshenv` for zsh, and for bash the file named by `BASH_ENV`, since a non-interactive `bash -c` reads that and never `~/.bashrc`:
 
 ```bash
-# ~/.zshenv (or ~/.bashrc)
+# ~/.zshenv -- or, for bash, a file exported as BASH_ENV from your login profile
 if [ -z "${LD_PRELOAD:-}" ] && [ -n "${TERMUX_ETC_LD_PRELOAD:-}" ]; then
     export LD_PRELOAD="$TERMUX_ETC_LD_PRELOAD"
 fi

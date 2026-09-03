@@ -16,7 +16,9 @@ make test         # Run Tier 1 (LD_PRELOAD) unit tests, Tier 2 (seccomp openat
                   # redirect + faccessat2 SIGSYS via sigsys_launcher +
                   # multithreaded clone race via sigsys_launcher +
                   # reentrancy-guard), and Tier 3 (narrow seccomp) integration
-                  # + reentrancy-guard tests.
+                  # + reentrancy-guard + LD_PRELOAD parking tests (LD_PRELOAD
+                  # is set to the Tier 1 library for that run, so the parking
+                  # assertion is exercised rather than skipped).
                   # NOTE: Tier 2 SIGSYS tests use sigsys_launcher (not
                   # termux-etc-seccomp directly) so they work from any
                   # environment including inside a wrapped shell.
@@ -66,7 +68,7 @@ A narrow seccomp supervisor tuned for dynamic musl binaries (Claude Code's `linu
 - `test/test-faccessat2.c`: Validates SIGSYS-to-ENOSYS rewrite for a single-threaded `faccessat2` call. Run via `sigsys_launcher build/test-faccessat2` (uses `sigsys_launcher` rather than `termux-etc-seccomp` so the test works from any environment, including from inside an already-wrapped shell where a second `SECCOMP_FILTER_FLAG_NEW_LISTENER` would fail with EBUSY).
 - `test/test-sigsys-threads.c`: Multithreaded regression test for the `clone()` race — 32 threads × 8 direct `faccessat2` syscalls. Verifies that no thread escapes the SIGSYS supervisor before being traced. Run via `sigsys_launcher build/test-sigsys-threads`. The same test run under the old `poll+SIGCHLD` design would exit 159 (SIGSYS kill) — demonstrates the race that motivated the TRACEME+blocking-`waitpid` redesign.
 - `test/test-seccomp-reentrancy.c`: Reentrancy-guard test for Tier 2 — verifies that the supervisor exports `TERMUX_ETC_WRAP_ACTIVE=1` into the child env and that a nested `termux-etc-seccomp` → `termux-etc-seccomp` invocation short-circuits cleanly (no `EBUSY` on duplicate listener install). Run via `termux-etc-seccomp build/test-seccomp-reentrancy`. Note: the PPID-based wrapper-binary discovery in this test requires `termux-etc-seccomp` to be the actual supervisor (not short-circuiting via the reentrancy guard), so this test must be run from a fresh terminal that is not already wrapped.
-- `test/test-mount.c`: Integration test for Tier 3 — verifies `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, and the reentrancy guard. Run via `termux-etc-mount build/test-mount`.
+- `test/test-mount.c`: Integration test for Tier 3 — verifies `/etc/resolv.conf` redirect, inherited-filter presence, unrelated-path passthrough, `LD_PRELOAD` parking (invariant 4: the target never sees `LD_PRELOAD`, and `TERMUX_ETC_LD_PRELOAD` carries the value), and the reentrancy guard. Run via `termux-etc-mount build/test-mount`; `make test` sets `LD_PRELOAD` for that run so invariant 4 is exercised, and adds a `sh -c` check that the parked value reaches a bionic child intact.
 - `test/test-terraform/main.tf`: Manual integration test for Terraform TLS via `termux-etc-seccomp terraform init`.
 - `make test` runs all tiers' unit/integration tests. Tier 2 SIGSYS tests use `sigsys_launcher` (not `termux-etc-seccomp` directly) so the full suite can run from inside a wrapped shell.
 

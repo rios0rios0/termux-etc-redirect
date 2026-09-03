@@ -403,8 +403,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    build_prefix();
-
     /*
      * Reentrancy guard. Two conditions short-circuit us to a plain execvp:
      *
@@ -431,6 +429,11 @@ int main(int argc, char *argv[]) {
         perror(argv[1]);
         return 127;
     }
+
+    /* Only the supervised path needs $PREFIX, and build_prefix() exits on an
+     * oversized value -- so it runs after the guard, as Tier 2 does, and a
+     * nested or traced invocation execs the target whatever PREFIX holds. */
+    build_prefix();
 
     /* SIGCHLD must interrupt poll() so we can reap a child that exited
      * without issuing a final openat. Do NOT set SA_RESTART — we need

@@ -106,7 +106,7 @@ claude -p "say ok"      # should print "ok" (or similar) from Anthropic API
 
 ## Give tool-call shells their shims back
 
-`termux-etc-mount` copies `LD_PRELOAD` to `TERMUX_ETC_LD_PRELOAD` and removes it before starting Claude, because the musl loader would otherwise fail to relocate Termux's bionic shims and exit before `main()`. Claude never sources a shell rc file, but every shell it spawns for a tool call does — which makes the rc file the one place that can hand the shims back to bionic descendants. Add to `~/.zshenv` (sourced by every zsh, interactive or not) or `~/.bashrc`:
+`termux-etc-mount` copies `LD_PRELOAD` to `TERMUX_ETC_LD_PRELOAD` and removes it before starting Claude, because the musl loader would otherwise fail to relocate Termux's bionic shims and exit before `main()`. Claude never sources a shell rc file, but every shell it spawns for a tool call does — which makes the rc file the one place that can hand the shims back to bionic descendants. Add it to `~/.zshenv`, which every zsh sources whether interactive or not. For bash, put it in its own file and `export BASH_ENV=<that file>` from your login profile: a non-interactive `bash -c` reads `BASH_ENV` and never `~/.bashrc`, so a snippet placed there would not reach tool-call shells.
 
 ```bash
 if [ -z "${LD_PRELOAD:-}" ] && [ -n "${TERMUX_ETC_LD_PRELOAD:-}" ]; then
