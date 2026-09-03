@@ -75,8 +75,12 @@ cat > "$HOME/.local/bin/claude" <<'EOF'
 export USER="${USER:-$(id -un)}"
 export HOME="${HOME:-/data/data/com.termux/files/home}"
 
-# Termux's bionic LD_PRELOAD shim cannot load into musl processes. Unset it.
-unset LD_PRELOAD
+# Termux's bionic LD_PRELOAD shims (termux-exec, Tier 1) cannot load into a
+# musl process, but the shells behind Claude's tool calls need them back --
+# without termux-exec every `#!/usr/bin/env` script they run exits 127.
+# termux-etc-mount parks the variable in TERMUX_ETC_LD_PRELOAD for exactly
+# that round trip, so it is deliberately NOT unset here. See "Give tool-call
+# shells their shims back" below.
 
 # Point Node at Termux's CA bundle so TLS works without /etc/ssl/certs.
 export NODE_EXTRA_CA_CERTS="$PREFIX/etc/tls/cert.pem"
@@ -100,6 +104,18 @@ claude --version        # should print "X.Y.Z (Claude Code)"
 claude -p "say ok"      # should print "ok" (or similar) from Anthropic API
 ```
 
+## Give tool-call shells their shims back
+
+`termux-etc-mount` copies `LD_PRELOAD` to `TERMUX_ETC_LD_PRELOAD` and removes it before starting Claude, because the musl loader would otherwise fail to relocate Termux's bionic shims and exit before `main()`. Claude never sources a shell rc file, but every shell it spawns for a tool call does — which makes the rc file the one place that can hand the shims back to bionic descendants. Add to `~/.zshenv` (sourced by every zsh, interactive or not) or `~/.bashrc`:
+
+```bash
+if [ -z "${LD_PRELOAD:-}" ] && [ -n "${TERMUX_ETC_LD_PRELOAD:-}" ]; then
+    export LD_PRELOAD="$TERMUX_ETC_LD_PRELOAD"
+fi
+```
+
+With that in place `make lint`, `make test` and any other `#!/usr/bin/env sh` script run unchanged inside a tool call, exactly as they do from a plain Termux tab.
+
 ## Why Tier 3 and not Tier 2 / proot
 
 - **Tier 2** wraps the binary in `termux-etc-seccomp`, whose ptrace supervisor auto-traces all descendants. When Claude spawns a tool-call subprocess — especially one that itself wants to install seccomp (`termux-etc-seccomp gh`) — the inner supervisor fails with `failed to receive notif fd`. Tier 2 also rewrites every `SIGSYS → -ENOSYS`, which is fine for Go's `os/exec.LookPath` but surfaces as `ENOSYS: lstat` in Claude's Node runtime.
@@ -114,4 +130,5 @@ claude -p "say ok"      # should print "ok" (or similar) from Anthropic API
 | `No such file or directory` on the binary | `patchelf` didn't set `PT_INTERP`, or the musl loader is missing | Re-run the `patchelf --set-interpreter` step; verify `~/.local/musl-loader/lib/ld-musl-aarch64.so.1` exists |
 | `EAI_AGAIN` / 403 from Anthropic API | `$PREFIX/etc/resolv.conf` missing or contains unreachable nameservers | `./scripts/install.sh` re-runs the resolv.conf seeder; or edit it manually |
 | `failed to receive notif fd` | Something already wraps Claude in Tier 2 or another ptracer | Switch that outer wrapper to Tier 3; Tier 3's reentrancy guard handles nesting cleanly |
+| `/usr/bin/env: No such file or directory`, or exit 127, from scripts run by tool calls | `LD_PRELOAD` was dropped for the musl binary and never restored for its bionic children, so `termux-exec` is not rewriting shebangs | Use a `termux-etc-mount` that parks the value in `TERMUX_ETC_LD_PRELOAD`, and restore it from `~/.zshenv` as shown above |
 | Version auto-updates and breaks | Anthropic's self-updater replaced `~/.local/bin/claude` with a symlink to an unpatched binary | Re-run the patchelf step; keep `DISABLE_AUTOUPDATER=1` in the wrapper to prevent recurrence |

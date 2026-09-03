@@ -19,6 +19,13 @@
  * with Seccomp=2 from an inherited system filter, so the proc field cannot
  * distinguish "our outer wrapper" from "Android's always-on baseline".
  *
+ * The target's environment is also adjusted for the libc it runs under. A
+ * musl loader treats an LD_PRELOAD entry it cannot relocate as fatal, and
+ * Termux's preload shims (termux-exec, Tier 1 of this project) are bionic,
+ * so LD_PRELOAD is parked in TERMUX_ETC_LD_PRELOAD before the execve: the
+ * musl target starts clean, and a bionic descendant that restores the
+ * variable from the parked copy gets the shims back -- see park_ld_preload().
+ *
  * Usage: termux-etc-mount <command> [args...]
  *
  * SPDX-License-Identifier: Apache-2.0
@@ -61,6 +68,13 @@
  * "an outer termux-etc-* wrapper has already installed a redirecting filter".
  */
 #define TERMUX_ETC_WRAP_ENV "TERMUX_ETC_WRAP_ACTIVE"
+
+/*
+ * Where LD_PRELOAD is parked for the duration of the musl target, so that the
+ * value survives into the target's environment without being loaded by the
+ * musl loader. See park_ld_preload().
+ */
+#define TERMUX_ETC_PARKED_PRELOAD_ENV "TERMUX_ETC_LD_PRELOAD"
 
 /*
  * Redirect table: source path -> destination suffix (appended to $PREFIX).
@@ -327,8 +341,50 @@ static void usage(const char *argv0) {
         "rewriting. Intended for dynamic musl binaries (Claude Code,\n"
         "Alpine-linked tools) whose libc bypasses LD_PRELOAD.\n\n"
         "If the process already has a seccomp filter or tracer attached,\n"
-        "the command is exec'd directly without adding another layer.\n",
+        "the command is exec'd directly without adding another layer.\n\n"
+        "LD_PRELOAD is parked in TERMUX_ETC_LD_PRELOAD for the command, so\n"
+        "the musl loader never sees Termux's bionic shims while a bionic\n"
+        "descendant can restore them from the parked copy.\n",
         argv0);
+}
+
+/*
+ * Move LD_PRELOAD out of the target's way without losing it.
+ *
+ * Termux exports LD_PRELOAD for every session so that termux-exec can rewrite
+ * `#!/usr/bin/env` and `#!/bin/sh` shebangs to their $PREFIX equivalents on
+ * execve, and the same variable is how Tier 1 of this project is enabled.
+ * Both libraries are bionic. A musl target cannot load them: musl's loader
+ * maps the library, fails to resolve its bionic symbols, prints
+ * "Error relocating ...: symbol not found" and exits before main().
+ *
+ * Unsetting the variable is the obvious fix, and what the Claude Code wrapper
+ * used to do -- but the environment is inherited, so every bionic process the
+ * target later spawns (the shell behind a tool call, make, the scripts they
+ * run) is left without the shims too, and each `#!/usr/bin/env` script fails
+ * with exit 127 under Claude while working from a plain Termux tab.
+ *
+ * Parking keeps both halves: the value is copied to TERMUX_ETC_LD_PRELOAD,
+ * which the musl loader ignores, and LD_PRELOAD is removed. A bionic
+ * descendant restores it from the copy; the natural place is the shell's rc
+ * file, which the target's tool calls source and the target itself never does:
+ *
+ *     [ -z "$LD_PRELOAD" ] && [ -n "$TERMUX_ETC_LD_PRELOAD" ] \
+ *         && export LD_PRELOAD="$TERMUX_ETC_LD_PRELOAD"
+ *
+ * An empty LD_PRELOAD is treated as absent. An already-parked value is
+ * overwritten: a shell that restored the variable and then launches a nested
+ * musl target through this wrapper wants the same round trip again. When the
+ * copy cannot be made, LD_PRELOAD is still removed -- a target that starts
+ * without the shims beats one that does not start at all.
+ */
+static void park_ld_preload(void) {
+    const char *preload = getenv("LD_PRELOAD");
+    if (preload != NULL && *preload != '\0'
+            && setenv(TERMUX_ETC_PARKED_PRELOAD_ENV, preload, 1) < 0) {
+        perror("termux-etc-mount: setenv(" TERMUX_ETC_PARKED_PRELOAD_ENV ")");
+    }
+    unsetenv("LD_PRELOAD");
 }
 
 /*
@@ -369,6 +425,8 @@ int main(int argc, char *argv[]) {
      * filter, so that field cannot distinguish "our wrapper" from baseline.
      */
     if (getenv(TERMUX_ETC_WRAP_ENV) != NULL || read_tracer_pid() > 0) {
+        /* The target is still a musl binary on this path: park before exec. */
+        park_ld_preload();
         execvp(argv[1], &argv[1]);
         perror(argv[1]);
         return 127;
@@ -427,6 +485,7 @@ int main(int argc, char *argv[]) {
         /* Mark the subtree as already-wrapped so nested invocations of
          * termux-etc-mount / termux-etc-seccomp short-circuit. */
         setenv(TERMUX_ETC_WRAP_ENV, "1", 1);
+        park_ld_preload();
 
         execvp(argv[1], &argv[1]);
         perror(argv[1]);
