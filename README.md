@@ -86,6 +86,15 @@ termux-etc-mount ~/.local/share/claude/versions/<version> -p "say ok"
 
 Tier 3 is ptrace-free and does **not** rewrite SIGSYS. Its BPF filter is identical to Tier 2's (openat-only on aarch64), but the supervisor is simpler and safer to nest inside other tracers. See `examples/claude-code.md` for an end-to-end Claude Code walkthrough.
 
+Tier 3 also moves `LD_PRELOAD` out of the target's way. Termux exports it for every session so that `termux-exec` can rewrite `#!/usr/bin/env` and `#!/bin/sh` shebangs on `execve`, and it is how Tier 1 is enabled — but both shims are bionic, and a musl loader treats an entry it cannot relocate as fatal. Unsetting the variable would leave every bionic process the target spawns without the shims too (each `#!/usr/bin/env` script then fails with exit 127), so the wrapper parks it instead: the value is copied to `TERMUX_ETC_LD_PRELOAD` and removed. Restore it for bionic descendants from a file every shell the target spawns reads, which the target itself never does: `~/.zshenv` for zsh, and for bash the file named by `BASH_ENV`, since a non-interactive `bash -c` reads that and never `~/.bashrc`:
+
+```bash
+# ~/.zshenv -- or, for bash, a file exported as BASH_ENV from your login profile
+if [ -z "${LD_PRELOAD:-}" ] && [ -n "${TERMUX_ETC_LD_PRELOAD:-}" ]; then
+    export LD_PRELOAD="$TERMUX_ETC_LD_PRELOAD"
+fi
+```
+
 ## How It Works
 
 ### Tier 1: LD_PRELOAD
@@ -130,6 +139,7 @@ Same BPF filter as Tier 2, same fd-injection path. The differences are deliberat
 - **No ptrace.** A tracer is required on exactly one process at a time; that's fatal for musl binaries like Claude that spawn seccomp-wrapped children or run under `strace`/`gdb`. Without ptrace, Tier 3 composes with any other supervisor.
 - **No SIGSYS rewriting.** Claude's Node/V8 runtime has no fallback for `statx`/`newfstatat` returning `-ENOSYS`; blanket rewriting (Tier 2's approach) produces confusing `ENOSYS: lstat` errors. Tier 3 lets Android's global policy handle SIGSYS natively.
 - **Reentrancy guard.** Before forking, the supervisor checks `TERMUX_ETC_WRAP_ACTIVE` — the env var it exports into the child immediately before `execve`ing the target. If present, or if `/proc/self/status:TracerPid` is non-zero, Tier 3 `execvp`s the target directly and relies on the outer wrapper's already-installed filter. The `/proc/self/status:Seccomp` field is deliberately not consulted — Android's zygote leaves every Termux process at `Seccomp=2` from an inherited system filter, indistinguishable from "our outer wrapper".
+- **LD_PRELOAD parking.** Immediately before `execve`, `LD_PRELOAD` is copied to `TERMUX_ETC_LD_PRELOAD` and removed, on the supervised path and on the reentrancy short-circuit alike. The musl loader ignores the parked name; a bionic descendant that restores the variable from it gets `termux-exec` and Tier 1 back. An already-parked value is overwritten, so a shell that restored it and launches a nested musl target gets the same round trip.
 
 ## When NOT to use this tool
 

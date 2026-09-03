@@ -12,8 +12,12 @@
  *      service every openat and invite notification-routing bugs).
  *   3. Unrelated /etc/ paths are NOT redirected — /etc/passwd (which
  *      exists on Android) must still be readable with its original content.
+ *   4. LD_PRELOAD never reaches the target: the supervisor parks it in
+ *      TERMUX_ETC_LD_PRELOAD, where a bionic descendant can restore it.
  *
  * Run with: termux-etc-mount build/test-mount
+ * (`make test` sets LD_PRELOAD to the Tier 1 library so invariant 4 is
+ * exercised rather than skipped.)
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -99,6 +103,26 @@ static int test_unrelated_path_not_redirected(void) {
     return 0;
 }
 
+static int test_ld_preload_parked(void) {
+    /* The supervisor moves LD_PRELOAD to TERMUX_ETC_LD_PRELOAD before the
+     * execve, so a musl target starts clean while a bionic descendant can
+     * restore the shims. Any LD_PRELOAD that reached this process is a
+     * failure; neither variable present means the wrapper was run by hand
+     * from a shell without a preload, which is nothing to park. */
+    const char *preload = getenv("LD_PRELOAD");
+    const char *parked = getenv("TERMUX_ETC_LD_PRELOAD");
+    if (preload != NULL && *preload != '\0') {
+        fprintf(stderr, "FAIL: LD_PRELOAD reached the target (%s)\n", preload);
+        return 1;
+    }
+    if (parked == NULL || *parked == '\0') {
+        printf("SKIP: no LD_PRELOAD in the caller's environment, nothing to park\n");
+        return 0;
+    }
+    printf("PASS: LD_PRELOAD parked in TERMUX_ETC_LD_PRELOAD (%s)\n", parked);
+    return 0;
+}
+
 static int test_reentrancy_guard(void) {
     /* Re-exec the same supervisor around `true`. If the guard is broken,
      * this either hangs (double listener) or fails with EPERM/EBUSY.
@@ -164,6 +188,7 @@ int main(void) {
     rc |= test_resolv_conf_redirect();
     rc |= test_wrap_env_var();
     rc |= test_unrelated_path_not_redirected();
+    rc |= test_ld_preload_parked();
     rc |= test_reentrancy_guard();
     if (rc == 0) printf("--- all tests passed ---\n");
     return rc;

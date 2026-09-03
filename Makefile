@@ -68,8 +68,13 @@ test: all $(BUILD_DIR)/test-redirect $(BUILD_DIR)/test-faccessat2 $(BUILD_DIR)/t
 	@echo "=== Tier 3: narrow seccomp (no ptrace) integration test ==="
 	$(CURDIR)/$(BUILD_DIR)/$(MOUNTNAME) cat /etc/resolv.conf
 	@echo ""
-	@echo "=== Tier 3: reentrancy guard test ==="
-	$(CURDIR)/$(BUILD_DIR)/$(MOUNTNAME) $(BUILD_DIR)/test-mount
+	@echo "=== Tier 3: reentrancy guard + LD_PRELOAD parking test ==="
+	LD_PRELOAD=$(CURDIR)/$(BUILD_DIR)/$(LIBNAME) $(CURDIR)/$(BUILD_DIR)/$(MOUNTNAME) $(BUILD_DIR)/test-mount
+	@echo ""
+	@echo "=== Tier 3: parked LD_PRELOAD reaches a bionic child intact ==="
+	LD_PRELOAD=$(CURDIR)/$(BUILD_DIR)/$(LIBNAME) $(CURDIR)/$(BUILD_DIR)/$(MOUNTNAME) sh -c \
+		'test -z "$${LD_PRELOAD:-}" && test "$${TERMUX_ETC_LD_PRELOAD:-}" = "$(CURDIR)/$(BUILD_DIR)/$(LIBNAME)" \
+		 && echo "PASS: child sees TERMUX_ETC_LD_PRELOAD and no LD_PRELOAD"'
 	@echo ""
 	@echo "=== All tests passed ==="
 
