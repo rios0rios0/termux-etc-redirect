@@ -1,3 +1,0 @@
-kind: 'Changed'
-body: 'refreshed the `code-review` skill''s secret-hygiene bullet to quote deliberately truncated vendor prefixes, replacing the matchable hyphenated Slack shape that tripped `gitleaks`'
-time: '2026-09-07T23:58:00.324926054Z'
