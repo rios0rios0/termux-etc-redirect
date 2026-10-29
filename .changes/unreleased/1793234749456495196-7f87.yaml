@@ -1,0 +1,3 @@
+kind: 'Changed'
+body: 'moved the agent instructions from `CLAUDE.md` to `AGENTS.md`, keeping a `CLAUDE.md` that imports it, pointed the `code-review` skill at `AGENTS.md`, documented `sigsys_launcher` and the reentrancy test''s `SKIP` path in `AGENTS.md`, and corrected the `README.md` guidance on nested and traced wrappers to match the reentrancy guard'
+time: '2026-10-29T00:45:49.456427536Z'

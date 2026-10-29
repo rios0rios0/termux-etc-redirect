@@ -143,8 +143,8 @@ Same BPF filter as Tier 2, same fd-injection path. The differences are deliberat
 
 ## When NOT to use this tool
 
-- **Do not wrap Tier 2 inside another tracer.** `strace termux-etc-seccomp ...` and `termux-etc-seccomp termux-etc-seccomp ...` both fail with `ptrace seize failed (Operation not permitted)` because `PTRACE_O_TRACEFORK` from the outer tracer grabs Tier 2's forked child before Tier 2 can seize it. Use Tier 3 when you need composable wrapping.
-- **Do not wrap a program in Tier 2 if it will spawn other Tier 2-wrapped subprocesses** (e.g. Claude → `gh`). The inherited seccomp filter and ptrace ancestry collide, surfacing as `Device or resource busy, failed to receive notif fd`. Tier 3's reentrancy guard + no-ptrace design avoids this.
+- **Do not wrap Tier 2 inside another tracer.** Under `strace` or `gdb`, `/proc/self/status:TracerPid` is non-zero, so Tier 2's reentrancy guard `execvp`s the target directly: no `openat` redirect and no SIGSYS rewrite. Tier 3 has the same guard but uses no ptrace, so run the tracer inside it (`termux-etc-mount strace <cmd>`) when you need tracing.
+- **Nested wrappers inherit the outer one.** When a wrapped program spawns another `termux-etc-*`-wrapped subprocess (e.g. Claude → `gh`), the inner wrapper sees `TERMUX_ETC_WRAP_ACTIVE`, skips its own supervisor, and relies on the outer filter. The subprocess therefore gets the outer tier's behaviour, so pick the outer tier for the whole tree — Tier 3 for a musl program like Claude.
 - **Do not use Tier 1 on musl binaries.** Termux's `libtermux-etc-redirect.so` is linked against bionic; the musl dynamic loader cannot load it. Even if you build a musl-linked copy, musl's DNS resolver uses direct `__syscall` invocations that never reach the PLT.
 - **Do not use Tier 3 as a general static-Go replacement.** If the target relies on `faccessat2 → ENOSYS` fallback (Go's `exec.LookPath`), use Tier 2 — only it rewrites that SIGSYS.
 
