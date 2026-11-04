@@ -13,6 +13,12 @@ nothing.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-11-04
+
+### Changed
+
+- moved the agent instructions from `CLAUDE.md` to `AGENTS.md`, keeping a `CLAUDE.md` that imports it, pointed the `code-review` skill at `AGENTS.md`, documented `sigsys_launcher` and the reentrancy test's `SKIP` path in `AGENTS.md`, and corrected the `README.md` guidance on nested and traced wrappers to match the reentrancy guard
+
 ## [0.9.1] - 2026-09-08
 
 ### Changed
